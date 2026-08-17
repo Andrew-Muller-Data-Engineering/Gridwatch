@@ -38,12 +38,12 @@ Analyze & report — SQL + business case
 ## Data sources
 
 - **Real**: [NESO Carbon Intensity API](https://carbonintensity.org.uk) — regional demand, generation mix, and carbon intensity across Great Britain's 14 official grid regions. Licensed under CC BY 4.0.
-- **Mock**: synthetic customer accounts, users, and product usage events, generated with Python and `faker`, joined to real regions via a shared `region_id`.
+- **Mock**: synthetic customer accounts, users, and product usage events, generated with Python and `faker`, joined to real regions via a shared `region_id`. Account placement, size (`properties_served`), and engagement patterns are weighted using real regional customer-density figures (UK Power Networks, SSEN) and the real Scotland wind-curtailment dynamic, rather than arbitrary/uniform assumptions — see the build guide's Phase 1 addendum for details and sources.
 
 ## Project status
 
 - [x] Environment setup (AWS, BigQuery, Git/GitHub, VS Code)
-- [ ] Phase 1 — Mock customer/usage data generation
+- [x] Phase 1 — Mock customer/usage data generation (450 accounts, region-weighted, seasonally-aware)
 - [ ] Phase 2 — Real data ingestion (Lambda + Step Functions)
 - [ ] Phase 3 — Transform (Glue)
 - [ ] Phase 4 — Load into BigQuery

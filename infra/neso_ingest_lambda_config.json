@@ -1,0 +1,12 @@
+{
+  "function_name": "gridwatch-neso-ingest",
+  "role_name": "gridwatch-neso-ingest-role",
+  "handler": "handler.lambda_handler",
+  "runtime": "python3.13",
+  "timeout": 30,
+  "memory_size": 128,
+  "region": "eu-west-2",
+  "s3_bucket": "gridwatch-raw-andy817",
+  "handler_file": "ingestion/lambdas/neso_ingest/handler.py",
+  "description": "Fetches NESO Carbon Intensity regional data and writes it to the S3 raw zone."
+}
