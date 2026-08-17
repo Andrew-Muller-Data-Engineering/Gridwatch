@@ -49,7 +49,7 @@ gridwatch/
 ├── transform/
 │   └── glue_jobs/
 │       └── clean_neso_data.py
-├── infra/                      (Step Functions state machine definitions, EventBridge schedule config)
+├── infra/                      (Step Functions state machine definitions, Lambda deploy config/scripts, EventBridge schedule config)
 ├── warehouse/
 │   ├── schema/
 │   │   └── create_tables.sql
@@ -743,11 +743,11 @@ print(f"Generated {len(accounts)} accounts, {len(users)} users, {len(events)} ev
 - **Why a separate S3 key per fetch, timestamped down to the second** (`raw/neso-demand/2026-08-17/2026-08-17T14-30-00.json`): S3 objects are immutable by key — writing to the same key twice overwrites the first one. A unique timestamped key per invocation means every historical fetch is preserved, which is exactly what you want for a time-series dataset like this.
 - **Why Step Functions wraps a single Lambda, rather than just scheduling the Lambda directly:** you could trigger the Lambda straight from EventBridge with no Step Functions involved — it would work. Wrapping it adds automatic retries (the API being briefly unavailable shouldn't mean a missed day of data) and a visual execution history you can screenshot for your portfolio, at basically zero extra cost (Step Functions' 4,000 free monthly state transitions comfortably covers a Lambda you're calling once a day or even every 30 minutes). It's also exactly where the distribution-level Lambda plugs in later, as a second branch in the same workflow — not a decision you want to retrofit once you're already scaling this into a multi-branch workflow.
 - **Why daily to start, not the full 30-minute settlement-period cadence:** the guide's Phase 2 plan mentions both. Daily is the better starting cadence while you're learning the AWS console — fewer executions to reason about while you're checking things work, comfortably inside every free-tier limit, and trivial to tighten to 30 minutes later (it's one field in the EventBridge schedule, not a code change).
-- **Why the AWS Console's inline code editor rather than a zip upload or the AWS Toolkit's deploy feature:** given `urllib`+`boto3` need no extra packaging, pasting the code directly into the Lambda console's editor is the simplest possible deploy path for a first Lambda — no zip file, no packaging step, no AWS Toolkit deploy configuration to get right. Worth revisiting once you're comfortable and want a faster edit-deploy loop (the Toolkit can deploy straight from VS Code), but not necessary for this first pass.
+- **Why a boto3 deploy script instead of the AWS Console's inline code editor:** the original plan here was console copy-paste — genuinely the simplest possible first deploy, and still how the Step Functions definition below gets deployed. But it means the console, not the repo, is the actual source of truth for what code is running: edit in the console and forget to copy it back into VS Code, and the repo silently goes stale — the exact failure mode a version-controlled "record of what's deployed" is meant to prevent, and the reason for switching before any code was actually pasted in. `infra/deploy_neso_ingest.py` fixes that the way a team that keeps Lambda code and config in a repo typically would: the handler code and its AWS configuration (runtime, memory, IAM role and permissions) both live in the repo as plain files, and a small boto3 script pushes them to AWS. Every deploy becomes a `git`-trackable action, and the console becomes somewhere you go to *observe* the function (logs, test runs), not edit it. It's not a full infrastructure-as-code framework (that's AWS SAM or CDK — a bigger jump, worth considering later once this pattern feels familiar) but it removes the console as a hidden source of truth, which is the part that actually matters for a "record of our Lambda code and config" habit.
 
 ### How
 
-**1. The code is already written into your repo** (I've placed it there directly): `ingestion/lambdas/neso_ingest/handler.py` and a placeholder `requirements.txt` (empty — no third-party dependencies needed, see Why above) plus `infra/neso_ingest_state_machine.json` (the Step Functions definition). 📝 Open `ingestion/lambdas/neso_ingest/handler.py` in VS Code to read through it before deploying anything — it's short, and worth understanding line by line before it's running unattended on a schedule.
+**1. The Lambda's own code already lives in your repo:** `ingestion/lambdas/neso_ingest/handler.py` and a placeholder `requirements.txt` (empty — no third-party dependencies needed inside the Lambda itself, see Why above). Alongside it, `infra/` holds everything about how that code gets deployed and run on AWS: `neso_ingest_state_machine.json` (the Step Functions definition, unchanged from before), and three new files — `neso_ingest_lambda_config.json` (the Lambda's settings: function name, runtime, memory, timeout, IAM role name, S3 bucket), `neso_ingest_trust_policy.json` (a small fixed IAM policy the role needs), and `deploy_neso_ingest.py` (the script that does the actual deploying — see Step 4). Save all three new files into your `infra/` folder now. 📝 Open `ingestion/lambdas/neso_ingest/handler.py` in VS Code to read through it before deploying anything — it's short, and worth understanding line by line before it's running unattended on a schedule.
 
 **2. Create the S3 bucket.**
 🌐 **Browser (AWS Console):**
@@ -756,57 +756,44 @@ print(f"Generated {len(accounts)} accounts, {len(users)} users, {len(events)} ev
 3. AWS Region: **eu-west-2 (London)** — matches the region you set in `aws configure` back in Section 1.1
 4. Leave **Block all public access** ticked (the default) — this data should never be public
 5. Leave everything else default → **Create bucket**
-6. Note the exact bucket name down somewhere — you'll paste it into the Lambda code next
+6. Note the exact bucket name down somewhere — you'll paste it into two places next
 
-**3. Update the placeholder bucket name in the Lambda code.**
-📝 **File — `ingestion/lambdas/neso_ingest/handler.py`:** find the line `S3_BUCKET = "your-bucket-name"` near the top and replace `"your-bucket-name"` with the exact bucket name from Step 2. Save.
+**3. Put the bucket name in both places that need it.** There are two separate copies of the bucket name in the repo, for two separate reasons — they must match exactly, or the Lambda will fail with an access-denied error the first time it tries to write:
+- 📝 **File — `ingestion/lambdas/neso_ingest/handler.py`:** find the line `S3_BUCKET = "your-bucket-name"` near the top and replace `"your-bucket-name"` with your real bucket name from Step 2. This is what the *running Lambda* uses at request time to know where to write.
+- 📝 **File — `infra/neso_ingest_lambda_config.json`:** set `"s3_bucket"` to the same exact bucket name. This is what the *deploy script* uses at deploy time to build the IAM permission that lets the Lambda write there at all.
 
-**4. Create the Lambda function.**
-🌐 **Browser (AWS Console):**
-1. Search "Lambda" → **Create function**
-2. Choose **Author from scratch**
-3. Function name: `gridwatch-neso-ingest`
-4. Runtime: the newest available **Python 3.x** option
-5. Leave **Create a new role with basic Lambda permissions** selected — this auto-generates an execution role with just CloudWatch Logs write access; you'll add S3 access to it next
-6. **Create function**
+Save both files.
 
-**5. Paste in your code and deploy.**
-🌐 **Browser (AWS Console), on the function's page:**
-1. Scroll to the **Code source** panel (should already be open on the **Code** tab)
-2. Select all the boilerplate code AWS pre-filled and delete it
-3. Paste in the full contents of your (now bucket-name-updated) `ingestion/lambdas/neso_ingest/handler.py`
-4. Click **Deploy** (orange button above the editor) — this is the step that actually makes your pasted code live; nothing runs until you click it
-
-**6. Give the Lambda permission to write to your S3 bucket.** By default, the auto-created role can only write logs — it has no S3 access at all yet.
-🌐 **Browser (AWS Console):**
-1. On the Lambda function's page, click the **Configuration** tab → **Permissions** (left-hand list)
-2. Click the role name under **Execution role** — this opens IAM in a new tab, already on that role's page
-3. Click **Add permissions** → **Create inline policy**
-4. Switch to the **JSON** editor tab and paste:
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::your-bucket-name/*"
-    }
-  ]
-}
+**4. Deploy the Lambda straight from the repo — no console paste required.**
+🖥️ **Terminal** (`.venv` activated, inside `gridwatch`):
 ```
-(replace `your-bucket-name` with your real bucket name from Step 2 — keep the `/*` at the end, it means "any object inside this bucket")
-5. Click **Next**, give the policy a name like `gridwatch-neso-ingest-s3-write`, then **Create policy**
+pip install boto3
+```
+This is a one-off local install, separate from the empty `requirements.txt` inside `ingestion/lambdas/neso_ingest/` — that one lists what ships *inside* the Lambda (deliberately nothing, see Why above); this `boto3` is a tool you run on your own machine to talk *to* AWS, not code the Lambda itself runs. (The Lambda's own runtime already has `boto3` built in.)
 
-**7. Test it manually, before scheduling anything.**
-🌐 **Browser (AWS Console), back on the Lambda function's page:**
+Before running the script, open `infra/neso_ingest_lambda_config.json` and check every value:
+- `s3_bucket` — must exactly match your Step 2 bucket name (see Step 3 above)
+- `handler` — must be `<filename-without-.py>.<function-name>`. Open `handler.py` and find the line defining the main function, e.g. `def lambda_handler(event, context):` — if yours is named differently, update `"handler"` in the config to match (`handler.lambda_handler` is only a placeholder assumption)
+- `region`, `function_name`, `role_name` — fine to leave as-is unless you have a reason to change them
+
+Then run the deploy script:
+🖥️ **Terminal:**
+```
+python infra/deploy_neso_ingest.py
+```
+This does everything the original Steps 4-6 did by hand in the console: creates an IAM execution role (with CloudWatch Logs access plus the S3 write permission, built from `s3_bucket` in the config), zips up `handler.py`, and creates the Lambda function from that zip. You'll see progress printed as it runs — `Created IAM role...`, `Waiting 10s for the new role to finish propagating...`, `Created new Lambda function...`.
+
+**From now on, every time you change `handler.py`:** save the file, then just re-run `python infra/deploy_neso_ingest.py` again — it detects the function already exists and updates its code and config instead of creating it fresh. That re-run is your whole edit-deploy loop; the AWS Console is for reading logs and test results, not for editing code.
+
+**5. Test it manually, before scheduling anything.**
+🌐 **Browser (AWS Console), on the function's page (search "Lambda" → click `gridwatch-neso-ingest`):**
 1. Click the **Test** tab
 2. **Event name:** anything, e.g. `manual-test`. Leave the JSON body as the default template (`{}`) — this Lambda ignores its input entirely, it always does the same thing
 3. Click **Save**, then click **Test**
 4. You should see **Execution result: succeeded**, with a response showing the `bucket` and `key` your function wrote to
 5. Confirm it for real: search "S3" → open your bucket → browse into `raw/neso-demand/` → you should see today's date folder, and inside it a `.json` file. Open it (Download, or click **Open**) and check it looks like real Carbon Intensity data — a `data` array containing a `regions` array with 18 entries
 
-**8. Create the Step Functions state machine.** First, find your AWS account ID (you'll need it for the next step): 🖥️ **Terminal:** `aws sts get-caller-identity` — the `Account` field in the output.
+**6. Create the Step Functions state machine.** First, find your AWS account ID (you'll need it for the next step): 🖥️ **Terminal:** `aws sts get-caller-identity` — the `Account` field in the output.
 🌐 **Browser (AWS Console):**
 1. Search "Step Functions" → **State machines** → **Create state machine**
 2. Choose to write it in code (look for **Code** / **Definition** as the editing mode, rather than the visual drag-and-drop designer)
@@ -816,13 +803,13 @@ print(f"Generated {len(accounts)} accounts, {len(users)} users, {len(events)} ev
 6. When asked about permissions, let it **create a new IAM role** — Step Functions will detect the Lambda referenced in your definition and generate a role scoped to invoke just that function
 7. **Create state machine**
 
-**9. Test the state machine.**
+**7. Test the state machine.**
 🌐 **Browser (AWS Console), on the state machine's page:**
 1. Click **Start execution** → leave the input as the default `{}` → **Start execution**
 2. Watch the execution graph — the single state should turn green (succeeded) within a few seconds
 3. Check S3 again for a new object — confirms the whole chain (Step Functions → Lambda → S3) works end to end
 
-**10. Schedule it with EventBridge.**
+**8. Schedule it with EventBridge.**
 🌐 **Browser (AWS Console):**
 1. Search "EventBridge" → look for **Scheduler** in the left-hand navigation (the newer, more flexible way to schedule things — if your console shows a different layout by the time you're doing this, search for "schedule" or "rule" and look for anything that lets you target a Step Functions state machine on a timer)
 2. **Create schedule**
@@ -832,15 +819,19 @@ print(f"Generated {len(accounts)} accounts, {len(users)} users, {len(events)} ev
 6. Permissions: let it auto-create the role needed to start the state machine
 7. **Create schedule**
 
-**11. Verify end to end, then commit.** Wait for the next scheduled run (or trigger it manually the same way as Step 9 to confirm sooner), check S3 for the new object, then commit `ingestion/` and `infra/` to a feature branch and merge — same pattern as Phase 1.
+**9. Verify end to end, then commit.** Wait for the next scheduled run (or trigger it manually the same way as Step 7 to confirm sooner), check S3 for the new object, then commit `ingestion/` and `infra/` to a feature branch and merge — same pattern as Phase 1.
 
-**Definition of done:** raw NESO data landing reliably in S3 on a schedule with no manual intervention, a Step Functions execution graph you can screenshot for your portfolio, and both the Lambda code and the state machine definition version-controlled in the repo as infrastructure-as-code.
+**Definition of done:** raw NESO data landing reliably in S3 on a schedule with no manual intervention, a Step Functions execution graph you can screenshot for your portfolio, and the Lambda's code *and* its AWS configuration (IAM role, memory, timeout) version-controlled in the repo and deployed with a repeatable `python infra/deploy_neso_ingest.py` rather than pasted into the console by hand.
 
 ### What — argument and concept reference
 
 - **ARN (Amazon Resource Name)** — AWS's unique identifier format for any resource, e.g. `arn:aws:lambda:eu-west-2:123456789012:function:gridwatch-neso-ingest` — service (`lambda`), region, account ID, resource type and name, in that order. The Step Functions definition needs your Lambda's exact ARN to know what to invoke.
-- **IAM inline policy** — a permissions policy attached directly to one specific role, rather than a reusable "managed policy" you might attach to many roles. Fine for a single-purpose role like this Lambda's.
+- **IAM inline policy** — a permissions policy attached directly to one specific role, rather than a reusable "managed policy" you might attach to many roles. Fine for a single-purpose role like this Lambda's. `deploy_neso_ingest.py` creates this one (the S3 write permission) programmatically instead of you pasting JSON into the console.
 - **`s3:PutObject`** — the specific IAM permission for writing a new object to S3; narrower than blanket S3 access, and scoped further here to just your one bucket via the `Resource` ARN.
+- **boto3** — AWS's official Python SDK (Software Development Kit); lets Python code call AWS APIs directly (create a role, deploy a function, and so on) instead of clicking through the console. `infra/deploy_neso_ingest.py` uses it for everything — `boto3.client("iam")` and `boto3.client("lambda")` are the two "clients" it talks to.
+- **Trust policy (`AssumeRolePolicyDocument`)** — a special kind of IAM policy attached to a *role* rather than a *user*, saying who or what is allowed to "become" that role. `infra/neso_ingest_trust_policy.json`'s `Principal: {"Service": "lambda.amazonaws.com"}` means only the Lambda service itself can assume this role — separate from the *permissions* policies (like the S3 write one above) that say what the role can do once assumed.
+- **AWSLambdaBasicExecutionRole** — an AWS-managed policy (maintained centrally by AWS, rather than written by you) granting just enough CloudWatch Logs access for a Lambda to write its own execution logs. Every Lambda needs at least this; `deploy_neso_ingest.py` attaches it automatically.
+- **IAM eventual consistency** — a newly created IAM role isn't always immediately usable everywhere — AWS's identity data takes a few seconds to finish propagating. `deploy_neso_ingest.py`'s 10-second wait after creating a new role is a pragmatic accommodation for this, not a bug; it only happens on the very first deploy.
 - **Amazon States Language (ASL)** — the JSON-based language Step Functions state machine definitions are written in. `StartAt` names the first state; `States` is a dictionary of every state in the workflow, keyed by name; `Type: "Task"` means "run something" (here, invoke a Lambda); `End: true` marks a state as the workflow's last step.
 - **`Retry` block** — `ErrorEquals: ["States.ALL"]` matches any error type; `IntervalSeconds`/`MaxAttempts`/`BackoffRate` control how long to wait before retrying, how many times, and how much longer to wait after each failed attempt (exponential backoff).
 - **EventBridge Scheduler** — AWS's dedicated scheduling service (distinct from the older "EventBridge Rules" you may see referenced elsewhere) for triggering something — here, a Step Functions execution — on a recurring or one-off schedule.
@@ -972,6 +963,7 @@ Terms you'll run into throughout this guide and in day-to-day data engineering w
 - **Serverless** — cloud services that run your code without you provisioning or managing the underlying machine yourself.
 - **EventBridge** — AWS's scheduling/event-routing service; used here to trigger the pipeline on a timer.
 - **Step Functions** — AWS's service for orchestrating multiple steps (e.g. several Lambdas) in a defined order, with built-in retry and error handling.
+- **boto3** — AWS's official Python SDK; the library `infra/deploy_neso_ingest.py` uses to create and update AWS resources directly from Python instead of the console.
 
 ## Data engineering / SQL
 - **ETL / ELT** — Extract, Transform, Load (or Extract, Load, Transform) — the general pattern of pulling data from a source, cleaning/reshaping it, and putting it somewhere useful.

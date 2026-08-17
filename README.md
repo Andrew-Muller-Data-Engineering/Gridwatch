@@ -56,7 +56,7 @@ Analyze & report — SQL + business case
 gridwatch/
 ├── ingestion/      Lambda functions, Step Functions definitions
 ├── transform/      Glue ETL scripts
-├── infra/          Step Functions state machine / EventBridge definitions
+├── infra/          Step Functions state machine, Lambda deploy config & script, EventBridge definitions
 ├── warehouse/      BigQuery schema and analytical SQL
 ├── mock_data/      Synthetic data generator
 ├── notebooks/      Exploratory analysis
