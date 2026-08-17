@@ -1,5 +1,5 @@
 {
-  "Comment": "GridWatch — invokes the NESO ingestion Lambda, then runs the Glue transform job against that data, with retries at each step, on a schedule set by EventBridge.",
+  "Comment": "GridWatch — invokes the NESO ingestion Lambda, runs the Glue transform job against that data, then loads the curated result into BigQuery, with retries at each step, on a schedule set by EventBridge.",
   "StartAt": "InvokeNesoIngestLambda",
   "States": {
     "InvokeNesoIngestLambda": {
@@ -21,6 +21,19 @@
       "Parameters": {
         "JobName": "gridwatch-neso-transform"
       },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "LoadCuratedIntoBigQuery"
+    },
+    "LoadCuratedIntoBigQuery": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:eu-west-2:YOUR_ACCOUNT_ID:function:gridwatch-bigquery-load",
       "Retry": [
         {
           "ErrorEquals": ["States.ALL"],

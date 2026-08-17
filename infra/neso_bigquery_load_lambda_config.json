@@ -1,0 +1,23 @@
+{
+  "function_name": "gridwatch-bigquery-load",
+  "role_name": "gridwatch-bigquery-load-role",
+  "handler": "handler.lambda_handler",
+  "runtime": "python3.13",
+  "timeout": 120,
+  "memory_size": 512,
+  "region": "eu-west-2",
+  "handler_dir": "ingestion/lambdas/neso_bigquery_load",
+  "requirements_file": "ingestion/lambdas/neso_bigquery_load/requirements.txt",
+  "deployment_bucket": "gridwatch-raw-andy817",
+  "deployment_key": "lambda-packages/gridwatch-bigquery-load.zip",
+  "s3_curated_bucket": "gridwatch-raw-andy817",
+  "s3_curated_prefix": "curated/neso-demand/",
+  "gcp_secret_name": "gridwatch/gcp-loader-key",
+  "gcp_project_id": "project-afcf460f-9631-4a0a-8d5",
+  "gcs_bucket": "gridwatch-curated-andy817",
+  "gcs_prefix": "curated/neso-demand/",
+  "bigquery_dataset": "gridwatch",
+  "bigquery_dataset_location": "europe-west2",
+  "bigquery_table": "fact_carbon_intensity_readings",
+  "partition_field": "reading_date"
+}

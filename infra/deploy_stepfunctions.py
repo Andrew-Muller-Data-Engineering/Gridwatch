@@ -1,7 +1,7 @@
 """
 Deploys the Step Functions state machine and its EventBridge schedule
 straight from the repo — the same boto3-deploy pattern used for the
-Lambda in deploy_neso_ingest.py, extended to cover the rest of Phase 2.
+Lambdas in deploy_neso_ingest.py / deploy_bigquery_load_lambda.py.
 
 Safe to re-run: creates everything fresh the first time, updates
 everything in place on every run after that.
@@ -11,9 +11,10 @@ automatically (by asking AWS who you are via STS), so you no longer need
 to manually replace YOUR_ACCOUNT_ID by hand before deploying.
 
 Run from the repo root, in VS Code's integrated terminal (.venv
-activated), after deploy_neso_ingest.py and deploy_glue_transform.py have
-already been run at least once (the Lambda and the Glue job themselves
-must exist first, since the state machine invokes/starts them by name):
+activated), after deploy_neso_ingest.py, deploy_glue_transform.py, and
+deploy_bigquery_load_lambda.py have all already been run at least once
+(the state machine invokes/starts all three by name, so all three must
+exist first):
 
     python infra/deploy_stepfunctions.py
 """
@@ -70,20 +71,20 @@ def ensure_role(iam, role_name, trust_policy_path, inline_policy_name, inline_po
     return role["Arn"]
 
 
-def build_state_machine_policy(lambda_arn, glue_job_arn, glue_managed_rule_arn):
-    """The state machine's workflow now has two steps — invoke the Lambda,
-    then run the Glue job — so its role needs permission for both, each
-    scoped to the one specific resource it needs, not a wildcard:
+def build_state_machine_policy(lambda_arns, glue_job_arn, glue_managed_rule_arn):
+    """The workflow now has three steps: invoke the ingestion Lambda, run
+    the Glue job, invoke the BigQuery-load Lambda. Its role needs
+    permission for all three, each scoped to the specific resource it
+    needs, not a wildcard:
 
-    - lambda:InvokeFunction, scoped to this one Lambda's ARN.
-    - glue:StartJobRun / GetJobRun(s) / BatchStopJobRun, scoped to this one
-      Glue job's ARN — the actions needed to start a Glue job and monitor
-      it to completion.
+    - lambda:InvokeFunction, scoped to exactly the two Lambda ARNs in
+      this workflow (not "every Lambda in the account").
+    - glue:StartJobRun / GetJobRun(s) / BatchStopJobRun, scoped to this
+      one Glue job's ARN.
     - events:PutRule / PutTargets / DescribeRule, scoped to a single,
       specific EventBridge rule AWS itself creates and manages
-      (StepFunctionsGetEventForGlueJobRunRule) purely as internal plumbing
-      for the ".sync" integration pattern below — Step Functions uses this
-      rule to know when the Glue job finishes, rather than polling.
+      (StepFunctionsGetEventForGlueJobRunRule) purely as internal
+      plumbing for the Glue step's ".sync" integration pattern.
     """
     return {
         "Version": "2012-10-17",
@@ -91,7 +92,7 @@ def build_state_machine_policy(lambda_arn, glue_job_arn, glue_managed_rule_arn):
             {
                 "Effect": "Allow",
                 "Action": "lambda:InvokeFunction",
-                "Resource": lambda_arn,
+                "Resource": lambda_arns,
             },
             {
                 "Effect": "Allow",
@@ -209,23 +210,28 @@ def main():
 
     account_id = sts.get_caller_identity()["Account"]
 
-    lambda_arn = lambda_client.get_function(FunctionName=config["lambda_function_name"])["Configuration"][
+    ingest_lambda_arn = lambda_client.get_function(FunctionName=config["lambda_function_name"])["Configuration"][
         "FunctionArn"
     ]
+    bigquery_load_lambda_arn = lambda_client.get_function(
+        FunctionName=config["bigquery_load_lambda_function_name"]
+    )["Configuration"]["FunctionArn"]
     glue_job_arn = f"arn:aws:glue:{config['region']}:{account_id}:job/{config['glue_job_name']}"
     glue_managed_rule_arn = (
         f"arn:aws:events:{config['region']}:{account_id}:rule/StepFunctionsGetEventForGlueJobRunRule"
     )
 
-    # The state machine's own role: allowed to invoke exactly one Lambda
-    # and run exactly one Glue job, nothing else — same least-privilege
-    # pattern as every other role in this project.
+    # The state machine's own role: allowed to invoke exactly the two
+    # Lambdas in this workflow and run exactly one Glue job, nothing
+    # else — same least-privilege pattern as every other role here.
     sfn_role_arn = ensure_role(
         iam,
         config["state_machine_role_name"],
         SFN_TRUST_POLICY_PATH,
-        f"{config['state_machine_name']}-invoke-lambda-and-glue",
-        build_state_machine_policy(lambda_arn, glue_job_arn, glue_managed_rule_arn),
+        f"{config['state_machine_name']}-invoke-lambdas-and-glue",
+        build_state_machine_policy(
+            [ingest_lambda_arn, bigquery_load_lambda_arn], glue_job_arn, glue_managed_rule_arn
+        ),
         f"Execution role for the {config['state_machine_name']} state machine",
     )
 

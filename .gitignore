@@ -5,3 +5,7 @@ __pycache__/
 *credentials*.json
 *.pem
 .DS_Store
+# GCP service account keys — a long-lived credential, must never reach Git.
+# Covers whatever filename `gcloud iam service-accounts keys create` writes.
+*-key.json
+*key*.json

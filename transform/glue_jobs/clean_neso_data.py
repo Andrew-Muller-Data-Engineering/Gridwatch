@@ -115,29 +115,50 @@ def build_dataframe(rows):
     # settlement period's start. This is what "partitioned by date" means
     # in practice — a later query for one day can skip straight to that
     # partition's files instead of scanning the whole curated zone.
-    df["reading_date"] = df["period_from"].dt.date.astype(str)
+    #
+    # Kept as a real date value (pandas/pyarrow's date32 type), not
+    # .astype(str) — a string that merely looks like a date isn't the
+    # same thing to a downstream consumer. BigQuery's own DAY partitioning
+    # (see warehouse/load_curated_to_bigquery.py) specifically requires a
+    # DATE/DATETIME/TIMESTAMP column and rejects a STRING one outright,
+    # even one holding "2026-08-17" — the exact error this replaced.
+    df["reading_date"] = df["period_from"].dt.date
 
     return df
 
 
 def write_partitioned_parquet(df, bucket, prefix):
-    """Writes Hive-style partitioned Parquet (reading_date=YYYY-MM-DD/...)
-    to a local temp folder via pyarrow, then uploads each resulting file
-    to S3 preserving that same folder structure. Avoids needing s3fs (an
-    extra dependency) just to let pandas/pyarrow write to an s3:// path
-    directly — boto3, already built into every Glue Python Shell job,
-    does the upload instead."""
-    table = pa.Table.from_pandas(df, preserve_index=False)
+    """Writes one Parquet file per reading_date, uploaded to a Hive-style
+    partition folder (reading_date=YYYY-MM-DD/data.parquet) so tools that
+    understand that folder-naming convention (Athena, a Glue Crawler)
+    still discover partitions automatically.
+
+    Deliberately NOT using pyarrow's own pq.write_to_dataset(...,
+    partition_cols=[...]) — that helper strips the partition column out
+    of each file once it's encoded in the folder name, which is the
+    normal, space-saving thing to do, but means anything reading a single
+    file in isolation (like a straightforward BigQuery load, in Phase 4)
+    never sees a reading_date column at all. Grouping and writing each
+    partition manually keeps reading_date as a real column inside the
+    file too, so the file is self-describing regardless of whether
+    whatever reads it understands Hive-style folder naming.
+
+    Using a fixed filename ("data.parquet") per partition, rather than a
+    fresh randomly-named file every run, also means re-running this job
+    again on the same day overwrites that day's file instead of quietly
+    accumulating duplicate files in the same partition folder."""
     s3 = boto3.client("s3")
+    uploaded = 0
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        pq.write_to_dataset(table, root_path=tmp_dir, partition_cols=["reading_date"])
+        for reading_date, partition_df in df.groupby("reading_date"):
+            table = pa.Table.from_pandas(partition_df, preserve_index=False)
+            local_dir = pathlib.Path(tmp_dir) / f"reading_date={reading_date}"
+            local_dir.mkdir(parents=True, exist_ok=True)
+            local_file = local_dir / "data.parquet"
+            pq.write_table(table, local_file)
 
-        tmp_path = pathlib.Path(tmp_dir)
-        uploaded = 0
-        for local_file in tmp_path.rglob("*.parquet"):
-            relative_path = local_file.relative_to(tmp_path).as_posix()
-            s3_key = f"{prefix}{relative_path}"
+            s3_key = f"{prefix}reading_date={reading_date}/data.parquet"
             s3.upload_file(str(local_file), bucket, s3_key)
             uploaded += 1
 

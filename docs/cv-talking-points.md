@@ -116,4 +116,42 @@ A running log of the reasoning behind specific technical decisions made while bu
 
 ---
 
-*(Next candidate for this log: whichever approach Phase 4 ends up using to bridge curated data from S3 into BigQuery — the two clouds don't share storage natively, so this is a genuine "how do you actually connect these" decision, not just another deploy script.)*
+## 9. Choosing a cross-cloud bridge deliberately — and rejecting two real alternatives
+
+**The concept:** AWS and GCP don't share storage — moving Phase 3's curated Parquet from S3 into BigQuery meant an explicit decision about *how* to cross that boundary, unlike every earlier phase, which stayed inside AWS entirely. Two genuine alternatives existed and were deliberately rejected, not overlooked: **BigQuery Omni** would let BigQuery query the S3 data in place with zero data movement — the most elegant option on paper, but it requires BigQuery Enterprise/Enterprise Plus edition, real recurring cost outside this project's always-free scope. **GCP's Storage Transfer Service** would pull from S3 on a schedule with no custom code at all — but it needs AWS access keys stored as a GCP-side credential (a second long-lived cross-cloud secret to manage, on top of the one the chosen approach already needed) and its own per-job cost and scheduling model.
+
+**What was built instead:** a plain script — download from S3, re-upload to GCS, load into BigQuery — following the exact same config-plus-deploy-script shape as every AWS resource already in the project, first proven manually from a laptop, then ported into a Lambda for automation once the underlying logic was trusted.
+
+**Why it matters:** this is the same shape of decision as Glue Python Shell vs. Spark in Phase 3 — evaluating the "proper," more powerful-looking option and consciously choosing simpler and cheaper because it actually fits the problem's real scale, rather than defaulting to whichever tool sounds most sophisticated on a CV.
+
+**Interview-ready framing:** *"AWS and GCP don't share storage, so bridging curated data into BigQuery needed an explicit decision, not just another deploy script. I evaluated BigQuery Omni (query S3 data in place, but requires a paid BigQuery edition) and GCP's Storage Transfer Service (managed, but needs AWS keys stored as a GCP credential and its own scheduling overhead) and rejected both in favor of a straightforward script — proven manually first, then automated — that fit the project's actual data volume and stayed inside the always-free tier on both clouds."*
+
+---
+
+## 10. One afternoon, three services, three different permission granularities
+
+**The situation:** getting the automated cross-cloud Lambda working meant debugging IAM-style permission errors from three genuinely different systems, back to back, each with its own idea of how "read" or "write" access should be scoped:
+
+1. **AWS S3:** the Lambda's role had `s3:GetObject` (needed to read a file) but not `s3:ListBucket` (needed to enumerate which files exist) — and critically, those two actions require *differently-shaped* `Resource` ARNs: `GetObject` needs an object-level ARN (`bucket/key`), while `ListBucket` needs the bucket-level ARN itself, with an `s3:prefix` condition to keep it narrowly scoped rather than the wildcard grant it might look like it needs.
+2. **GCP Cloud Storage:** granting `roles/storage.objectCreator` seemed right for "this job writes files here" — until it turned out overwriting an *existing* object (which a daily re-run legitimately needs to do) requires delete permission on the previous version too, something Creator deliberately excludes. `roles/storage.objectAdmin` was the actual fit.
+3. **BigQuery:** the newer `bq add-iam-policy-binding` command for granting dataset-level access failed outright with "this feature requires allowlisting" — an unrelated Google-side rollout gate, not a permissions problem at all. The fix was falling back to BigQuery's older, still fully-supported dataset **Sharing** panel in the console, which uses BigQuery's own long-standing ACL system rather than the newer Cloud-IAM-integrated path.
+
+**Why it matters:** none of these were the same bug wearing a different name — each one was a genuinely distinct permission model with its own granularity, its own required resource shape, and in one case, its own separate rollout status across projects. The pattern worth taking away isn't a specific fix, it's the instinct: when a permission error shows up, don't assume it behaves like the last cloud's permission error — go find that specific service's own model for what "least privilege" means there.
+
+**Interview-ready framing:** *"Wiring up a Lambda that touches AWS S3, GCP Cloud Storage, and BigQuery in one run meant hitting three separately-scoped permission errors in one afternoon — S3 needing a bucket-level ARN for ListBucket versus an object-level one for GetObject, GCS's object-creator role not covering overwrites, and BigQuery's newer IAM-binding command being allowlist-gated on that project, requiring the older Sharing-panel fallback. It reinforced that 'least privilege' isn't one concept portable across services — each one has its own model, and debugging it well means learning that model rather than pattern-matching from the last one."*
+
+---
+
+## 11. A deliberate, documented trade-off: static credential now, keyless later
+
+**The situation:** the automated Lambda needs to authenticate to GCP somehow. The modern, best-practice answer is Workload Identity Federation (WIF) — the Lambda's own short-lived AWS credentials get exchanged for a short-lived GCP token at runtime, with no long-lived secret stored anywhere, ever. The simpler answer is a GCP service account key: a static JSON credential, stored in AWS Secrets Manager, fetched at runtime. WIF was consciously set aside in favor of the key — a real trade-off, not an oversight, made explicit up front rather than discovered as a limitation later.
+
+**An unexpected twist:** Google's own defaults nearly forced the decision anyway — `gcloud iam service-accounts keys create` failed outright with `FAILED_PRECONDITION: Key creation is not allowed on this service account`, a newer default on GCP projects specifically designed to push people toward WIF instead of static keys. After confirming the constraint was genuinely locked at the project level (not something an org-policy override could fix here), the key still turned out to be creatable through the console's own UI rather than the CLI — a useful reminder that a blocked CLI path and a blocked *capability* aren't automatically the same thing, worth actually verifying before assuming a fallback plan is necessary.
+
+**Why it matters:** the honest trade-off here — "static key now, deliberately, with a clear path to something better later" — is a more credible answer in an interview than either pretending WIF was too complicated to consider, or building it under pressure without being able to explain the decision clearly. Naming a limitation you chose, and explaining exactly what it would take to remove it, reads as more senior than avoiding the topic.
+
+**Interview-ready framing:** *"I authenticated the automated Lambda to GCP using a service account key in Secrets Manager rather than Workload Identity Federation — a deliberate simpler-first choice, with the trade-off (a long-lived static credential vs. WIF's short-lived tokens) named explicitly rather than left implicit. Interestingly, Google's own default policy on newer projects blocks key creation via the CLI specifically to push people toward WIF — I confirmed that was genuinely locked rather than something I was missing, worked around it through the console UI instead, and I've got a clear next step already scoped if I want to remove the static credential later."*
+
+---
+
+*(Next candidate for this log: Phase 5's SQL analysis — likely an entry on handling the growth-vs-seasonality confound in usage_events, flagged back in the Phase 1 addendum but not yet actually solved in a query.)*
