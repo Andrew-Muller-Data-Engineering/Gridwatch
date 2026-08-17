@@ -63,4 +63,57 @@ A running log of the reasoning behind specific technical decisions made while bu
 
 ---
 
-*(Next candidate for this log: extending the same boto3-deploy pattern to the Step Functions state machine and EventBridge schedule — likely another entry on "IAM roles for cross-service invocation," since Step Functions needs its own role scoped to just `lambda:InvokeFunction` on this one function.)*
+## 5. IAM roles for cross-service invocation — chained, narrowly-scoped delegation
+
+**The concept:** Phase 2's pipeline isn't just one AWS service calling AWS on your behalf — it's three services calling *each other*, in a chain: EventBridge Scheduler starts a Step Functions execution, which invokes a Lambda, which writes to S3. Each link in that chain is a different AWS service assuming a role to act, and — following the same principle as the Lambda's own role — each of those roles is scoped to do exactly one thing and nothing else:
+- The **Lambda's role** can `s3:PutObject` on one bucket, nothing more (Entry 1).
+- The **state machine's role** can `lambda:InvokeFunction`, scoped by `Resource` to that one Lambda's ARN. It cannot invoke any other function in the account, even though the trust policy lets Step Functions assume the role at all.
+- The **schedule's role** can `states:StartExecution`, scoped by `Resource` to that one state machine's ARN. It cannot start any other state machine.
+
+**What this means in practice for GridWatch:** `infra/deploy_stepfunctions.py`'s `ensure_role()` function is deliberately generic — it creates a role from a trust policy and attaches an inline permission policy, and it's called twice with two completely different trust policies (`states.amazonaws.com`, `scheduler.amazonaws.com`) and two completely different permission policies (`build_invoke_lambda_policy`, `build_start_execution_policy`). Same shape, reused, because the underlying pattern — a role that trusts one specific service and can do one specific narrowly-scoped thing — doesn't change; only the specific service and the specific permission do.
+
+**Why it matters:** this is what "least privilege" looks like once a pipeline has more than one moving part — it isn't a single decision made once, it's a discipline applied at every hop. If the schedule's role were accidentally given `states:StartExecution` on `*` instead of one ARN, an attacker (or a bug) that gained control of the schedule could kick off *any* state machine in the account, not just this one. Scoping every role to a specific `Resource` ARN, not a wildcard, is what keeps a compromise at any single link contained to that link.
+
+**Interview-ready framing:** *"The pipeline chains three AWS services calling each other — EventBridge starts Step Functions, which invokes Lambda — so I gave each hop its own IAM role, scoped by resource ARN to the one specific thing it needs to do next, rather than one broad role shared across the chain. My deploy script's role-creation logic is generic and reused for both roles, since the pattern — narrow trust, narrow permission — is identical each time; only the service and the action change."*
+
+---
+
+## 6. `rate()` vs. `cron()` — choosing a schedule that means what you think it means
+
+**The situation:** the original EventBridge schedule used `rate(1 day)` — simple, and it worked. But "every 24 hours" and "every day at a specific time" are not the same guarantee: a `rate()` expression is anchored to whenever the schedule happened to be *created*, not to any clock time, so it drifts to whatever time of day that was — fine for a first test, not what you'd actually want for something meant to double as a daily reporting feed, where a predictable, fixed time of day (9am, standard for reporting) matters more than the exact interval between runs.
+
+**The fix:** switched to `cron(0 9 * * ? *)` — an exact "minute 0 of hour 9, every day" — plus an explicit `ScheduleExpressionTimezone: "Europe/London"` on the schedule. The timezone setting is the part that's easy to miss: a bare `cron()` expression is evaluated in UTC, so without it, "9am" silently becomes "9am UTC," which is 9am UK time in winter (GMT) but 10am UK time in summer (BST) — a schedule that quietly runs an hour "wrong" for half the year unless you notice.
+
+**Why it matters:** it's a small, specific example of a broader class of scheduling bug — one that's easy to introduce and easy not to notice, since it only manifests as an hour's drift twice a year around the clock changes, not as an obvious failure. Choosing `cron()` with an explicit IANA timezone name over a `rate()` expression is a deliberate trade (a few more characters of config) for a schedule that actually means "9am, always" rather than "roughly once a day, at a time that happens to drift."
+
+**Interview-ready framing:** *"I initially scheduled the pipeline with a `rate(1 day)` expression, which just repeats every 24 hours from creation time rather than running at a fixed clock time. Since this was meant to model a daily reporting feed, I switched to a `cron()` expression with an explicit timezone instead — otherwise the schedule would silently drift by an hour every time UK clocks change for BST or GMT, since cron expressions are evaluated in UTC by default."*
+
+---
+
+## 7. Choosing Glue Python Shell over Spark — matching compute to actual workload
+
+**The concept:** AWS Glue's headline offering is Spark-based ETL — genuinely built for large-scale distributed data processing, and it's what most people picture when they hear "AWS Glue." But Spark jobs spin up a small cluster to run, which costs real money whether the dataset is a terabyte or, as in GridWatch's case, 18 small JSON records fetched once a day. **Glue Python Shell** is a different job type entirely — a single lightweight Python process, no cluster — billed at Glue's smallest compute tier (0.0625 DPU, a fraction of Glue's already-small unit of compute) rather than whatever a Spark cluster's minimum footprint would cost.
+
+**What this means in practice for GridWatch:** `infra/neso_transform_glue_config.json` sets `"max_capacity": 0.0625` and the job's `Command.Name` to `"pythonshell"` rather than `"glueetl"` (Spark). The transform logic itself (`transform/glue_jobs/clean_neso_data.py`) is plain `pandas`/`pyarrow`, not PySpark — appropriate for a dataset this small, and it still counts as real, hands-on AWS Glue experience, since the service, the job type, and the deployment pattern are all genuinely Glue, not a workaround that avoids it.
+
+**Why it matters:** this is a deliberate example of matching infrastructure choice to actual data volume, rather than defaulting to whichever tool has the most name recognition. Glue ETL (Spark) would work here — it just wouldn't be a good decision, since it solves a scaling problem this project doesn't have, at a cost this project doesn't need to pay. Recognizing when a "bigger" tool is the wrong tool is as much a signal of real engineering judgment as knowing how to use the bigger tool at all.
+
+**Interview-ready framing:** *"I chose Glue Python Shell over Glue's Spark-based ETL jobs for the transform layer, since the actual daily data volume — a couple of dozen small JSON readings — doesn't need distributed processing, and a Spark cluster's minimum footprint would have been paying for scale I didn't need. Python Shell runs as a single lightweight process at Glue's smallest compute tier, while still being genuine, billable AWS Glue rather than a workaround."*
+
+---
+
+## 8. Step Functions' `.sync` integration — and the IAM permissions it quietly requires
+
+**The situation:** chaining the Glue transform job into the existing Step Functions workflow looked, at first glance, like it should need only one new permission — `glue:StartJobRun` on the state machine's role, so it could kick the job off. That's not quite enough for a *meaningful* result, though: without more, Step Functions would mark that state "succeeded" the instant the Glue API confirmed the job had *started*, regardless of whether the job then went on to actually finish or fail a minute later.
+
+**The fix — the `.sync` suffix:** changing the state's `Resource` from `arn:aws:states:::glue:startJobRun` to `arn:aws:states:::glue:startJobRun.sync` tells Step Functions to actually wait for the Glue job to reach a terminal state (succeeded or failed) before marking its own state complete, and to propagate a failure if the Glue job fails. Functionally, this is the difference between "did I *start* the transform" and "did the transform *work*" — the second one is the actual thing worth knowing.
+
+**The IAM cost of that convenience:** `.sync` isn't free in permissions terms — AWS implements it under the hood using a managed EventBridge rule (`StepFunctionsGetEventForGlueJobRunRule`) that Step Functions creates and uses to get notified when the Glue job finishes, rather than polling in a loop. That means the state machine's role needs `glue:GetJobRun`/`GetJobRuns`/`BatchStopJobRun` (to check status and, if needed, stop a stuck job) *and* `events:PutRule`/`PutTargets`/`DescribeRule` scoped to that one specific managed rule — permissions that have nothing to do with Glue directly, and are easy to miss if you're reasoning only about "what does this state need to call."
+
+**Why it matters:** it's a concrete example of a service integration's convenience (`.sync` doing the polling for you) coming with implementation details that leak into what IAM permissions you actually need — the kind of thing you only really learn by hitting it, not by reading the state's definition in isolation. Knowing to look for this — rather than being surprised by an `AccessDenied` on a permission that seems unrelated to the task at hand — is a genuinely useful pattern-recognition skill for AWS service integrations generally, not just this one.
+
+**Interview-ready framing:** *"When I added a Glue job as a second step in an existing Step Functions workflow, I used the `.sync` integration pattern so the workflow would actually wait for the job to finish rather than just confirming it started. That meant the state machine's role needed more than `glue:StartJobRun` — `.sync` uses a managed EventBridge rule under the hood to detect job completion, so the role also needed narrowly-scoped `events:PutRule`/`PutTargets`/`DescribeRule` permissions on that specific rule. It's a good example of a service integration's internal mechanics surfacing as IAM requirements you wouldn't guess from the state's definition alone."*
+
+---
+
+*(Next candidate for this log: whichever approach Phase 4 ends up using to bridge curated data from S3 into BigQuery — the two clouds don't share storage natively, so this is a genuine "how do you actually connect these" decision, not just another deploy script.)*
