@@ -1,0 +1,11 @@
+{
+  "state_machine_name": "gridwatch-neso-ingestion",
+  "state_machine_role_name": "gridwatch-neso-ingestion-role",
+  "state_machine_definition_file": "infra/neso_ingest_state_machine.json",
+  "region": "eu-west-2",
+  "lambda_function_name": "gridwatch-neso-ingest",
+  "schedule_name": "gridwatch-neso-daily",
+  "schedule_role_name": "gridwatch-neso-daily-schedule-role",
+  "schedule_expression": "cron(0 9 * * ? *)",
+  "schedule_expression_timezone": "Europe/London"
+}
