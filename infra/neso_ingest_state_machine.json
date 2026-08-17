@@ -1,0 +1,19 @@
+{
+  "Comment": "GridWatch — invokes the NESO ingestion Lambda, with retries, on a schedule set by EventBridge.",
+  "StartAt": "InvokeNesoIngestLambda",
+  "States": {
+    "InvokeNesoIngestLambda": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:eu-west-2:YOUR_ACCOUNT_ID:function:gridwatch-neso-ingest",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

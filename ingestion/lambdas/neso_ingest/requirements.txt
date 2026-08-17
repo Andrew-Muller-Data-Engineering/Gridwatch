@@ -1,0 +1,5 @@
+# No third-party dependencies needed — this Lambda only uses Python's
+# standard library (urllib, json, datetime) plus boto3, which AWS
+# pre-installs in every Lambda Python runtime. This file exists mainly
+# as documentation, and as the place to add real dependencies later if
+# this Lambda grows beyond a single stdlib-only file.

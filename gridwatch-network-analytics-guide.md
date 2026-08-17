@@ -10,6 +10,8 @@ A complete, self-contained build guide: environment setup through to a finished 
 
 This mirrors real T&D-sector data work closely: you'll be handling genuine transmission and distribution data, building the kind of platform that a company selling into DNOs (Distribution Network Operators) or National Energy System Operator-adjacent services might actually build.
 
+**A note on data granularity (accounts vs. properties):** it's easy to assume GridWatch should be working with data at the level of individual households/properties, since that's the scale a DNO's network ultimately serves (millions of premises) — and that's the right instinct if you're used to energy *retail* (supplier) data, where billing genuinely happens per property. Network operators work differently: they consume and publish data aggregated at substation/feeder or regional level (DNOs' own published smart meter datasets are explicitly aggregated — e.g. National Grid Electricity Distribution's "Aggregated Smart Meter Data – Secondary Substation" — with raw household-level access requiring a formal, Ofgem-governed Data Privacy Plan, not the default). GridWatch's own customers (the `accounts` table) are DNO ops teams — a few hundred at most, not millions — while the real-world property scale those teams are responsible for shows up as a `properties_served` field on each account instead. See the Phase 1 addendum below for how this plays out in the actual data.
+
 ---
 
 ## Skills this demonstrates (→ CV mapping)
@@ -71,6 +73,8 @@ gridwatch/
 - **`infra/` treats your Step Functions definitions as code**, version-controlled alongside everything else — a small detail, but it signals infrastructure-as-code thinking, which is worth having on a CV project.
 - **One shared `.venv/` at the root** is enough for a project this size — no need for a separate environment per Lambda locally (you'll only need isolated dependency lists when you actually package a Lambda for deployment).
 - **`mock_data/output/` is gitignored** — generated data doesn't need to live in Git since the scripts can regenerate it any time; committing multi-thousand-row CSVs just bloats the repo's history.
+
+**Important — the folder must be named exactly `mock_data` (underscore, no space).** Every command later in this guide (`python mock_data/generate_data.py`, `from regions import REGIONS`, `mock_data/output/...`) is a literal path. A folder named `mock data` (with a space) will make every one of those commands fail with a "file not found" style error, since as far as the terminal is concerned that's a completely different path. If you create folders by hand in Finder/File Explorer rather than copy-pasting, double check this one specifically.
 
 **Working in VS Code:** open the `gridwatch` folder itself as your workspace (File → Open Folder), not any subfolder — this is what makes Source Control, the Python interpreter, and the file explorer all work correctly across the whole project at once.
 
@@ -167,7 +171,7 @@ It will prompt you one line at a time — paste in your Access Key ID, then your
 ```
 aws sts get-caller-identity
 ```
-It should return your IAM user's account ID and ARN (Amazon Resource Name — a unique ID AWS gives every resource you create), confirming the CLI is correctly authenticated against your new user.
+It should return your IAM user's account ID and ARN (Amazon Resource Name — a unique ID AWS gives every resource you create), confirming the CLI is correctly authenticated against your new user. **Keep this account ID handy — Phase 2 needs it.**
 
 ## 1.2 — VS Code configured for AWS
 
@@ -252,7 +256,7 @@ GitHub Desktop now shows your new repo with one file (`README.md`) already insid
 ### Step 6: Add the folder structure
 1. Open the `gridwatch` folder you just created, in File Explorer (Windows) or Finder (Mac)
 2. Right-click inside the folder → **New** → **Folder** (Windows) or right-click → **New Folder** (Mac)
-3. Create each of these, one at a time: `ingestion`, `transform`, `infra`, `warehouse`, `mock_data`, `notebooks`, `docs`, `tests` (see the **Repository structure** section above for what each is for)
+3. Create each of these, one at a time: `ingestion`, `transform`, `infra`, `warehouse`, `mock_data`, `notebooks`, `docs`, `tests` (see the **Repository structure** section above for what each is for) — note the underscore in `mock_data`, not a space
 4. Worth knowing: Git only tracks a folder once it has at least one file inside it, so these will look "empty" to Git for now — that's fine, nothing to fix yet
 
 ### Step 7: Add your `.gitignore` file — do this before adding any real project files
@@ -297,22 +301,52 @@ This stops Python clutter *and*, critically, stops you ever accidentally uploadi
 
 From now on, in GitHub Desktop, the **Repository** menu → **Open in Visual Studio Code** always opens this project correctly.
 
-### Step 12: Making changes day-to-day
-**Using VS Code's Source Control panel:**
-1. Edit any file and save it (Ctrl/Cmd+S)
-2. Click the Source Control icon in the sidebar
-3. Hover over a changed file and click the **+** that appears (this "stages" it) — or click the **+** next to "Changes" at the top to stage everything at once
-4. Type a short commit message in the text box at the top of the panel
-5. Click the blue **✓ Commit** button
-6. Click **Sync Changes** (appears afterward, at the bottom) to push it to GitHub
+### Step 12: Making changes day-to-day — now with branches
 
-**Using GitHub Desktop instead — exactly the same result, different buttons:**
-1. Switch to GitHub Desktop — your changed files appear automatically
-2. Type a commit message in the bottom-left box
-3. Click **Commit to main**
-4. Click **Push origin** at the top
+**Why branch instead of committing straight to `main`:** `main` is meant to always be in a working state — the version you'd show someone, or come back to after a break. A **branch** is a parallel, independent copy of the project where you can make changes, break things, experiment, and commit as many half-finished attempts as you like, without touching `main` at all. Once the change is finished and working, you **merge** it back into `main` in one clean step. This matters more as the project grows: from Phase 2 onward you're touching AWS resources, and a broken half-written Lambda sitting on `main` is a worse place to be than the same broken code sitting safely on its own branch until it's ready.
 
-Use whichever one feels more natural at the time — they update the same repository either way.
+**The pattern for every change, from now on:**
+1. Create a branch, named for what you're about to do (e.g. `phase1-mock-data`, `fix-mock-data-folder-name`)
+2. Make your changes and commit them to that branch — as many small commits as you like
+3. Push the branch to GitHub
+4. Merge it back into `main` once it's finished and working (either directly, or via a **pull request** — see the **What** section below)
+5. Delete the branch — its commits live on inside `main`'s history once merged, so deleting the branch itself loses nothing
+
+**How — using GitHub Desktop:**
+1. Open GitHub Desktop, with the GridWatch repo selected
+2. Click the **Current branch** dropdown near the top (it currently says "main")
+3. Click **New branch**
+4. Type a name (lowercase, hyphens instead of spaces, e.g. `phase1-mock-data`) and click **Create branch**
+5. GitHub Desktop automatically switches you onto it — the dropdown now shows your new branch name instead of "main"
+6. Work as normal: edit files in VS Code, save them, then back in GitHub Desktop write a commit message and click **Commit to `<branch-name>`**
+7. Click **Publish branch** (first time) or **Push origin** (after that) to send it to GitHub
+8. When the change is finished and working: click the **Current branch** dropdown → switch to `main` → click **Branch** (top menu) → **Merge into current branch...** → pick your feature branch → **Merge**
+9. Push `main` again (**Push origin**) to send the merged result to GitHub
+10. Optional cleanup: **Branch** (top menu) → **Delete...** → pick the now-merged branch → confirm
+
+**How — using VS Code instead:**
+1. Click the branch name in the bottom-left corner of the VS Code window (it shows "main")
+2. Choose **Create new branch...** from the list that appears
+3. Type a name and press Enter — VS Code switches you onto it automatically (the bottom-left corner updates to show the new name)
+4. Work, save, and commit through the Source Control panel exactly as before: stage changes with the **+**, type a message, click **✓ Commit**
+5. Click **Sync Changes** (or **Publish Branch** the first time) to push it
+6. To merge back: click the branch name bottom-left → switch to `main` → open the Source Control panel → click the **...** menu → **Branch** → **Merge Branch...** → pick your feature branch
+7. Push `main` (**Sync Changes**)
+8. Optional cleanup: click the branch name bottom-left → **Delete branch...**
+
+**On pull requests (optional, but worth knowing):** instead of merging locally (Steps 8-9 above), you can push the branch and open a **pull request** on github.com instead — same end result (the branch merges into `main`), but it gives you a page showing exactly what changed before it merges. It's the standard way collaborative teams review code, and "opened and merged pull requests" is a genuinely relevant Git skill to have practiced, even solo.
+
+**When it's fine to skip branching:** tiny, low-risk edits — fixing a typo in the README, tweaking a comment — are fine committed straight to `main`. Anything that touches actual pipeline code, or that you're not fully sure works yet, goes on a branch.
+
+Use whichever app (GitHub Desktop or VS Code) feels more natural at the time for any given step — they update the same repository either way.
+
+### What — branching reference
+
+- **Branch** — a parallel, independent line of commits, starting from wherever `main` was when you created it. Changes on a branch don't affect `main` until you merge.
+- **Merge** — folding one branch's commits into another (typically a feature branch back into `main`).
+- **Pull request (PR)** — a GitHub page proposing that one branch be merged into another, showing the diff and allowing comments, before the merge actually happens. Standard practice on real teams; optional but good practice solo.
+- **Feature branch** — informal name for a branch created for one specific piece of work, deleted once merged.
+- **Checkout / switch** — moving your working copy of the files to match a different branch's version.
 
 ---
 
@@ -339,10 +373,9 @@ For the Glue gap: use the smallest possible job configuration (covered in Phase 
 
 - **Why this phase exists at all:** in a real company, GridWatch's customer and usage data would already exist in a production database — it's the one thing here that's genuinely proprietary, so nobody publishes it for you to download. You have to invent it, but invent it *deliberately*, so it behaves like real data would: messy, varied, with a genuine pattern hiding in it for Phase 5 to find, rather than something perfectly clean and obviously fake.
 - **Why resolve the join key before writing any data:** later, you'll want to ask questions like "do accounts in high-stress network regions engage less with the product?" That only works if your mock accounts and the real NESO data agree on what a "region" is. NESO's Carbon Intensity API already defines a fixed, official list of 14 GB regions with stable numeric IDs — reusing that exact list, rather than inventing your own region names, is what makes a later SQL join actually work instead of silently returning nothing.
-- **Why `faker` and `pandas` specifically:** `faker` generates realistic fake data (names, companies, dates) so you're not hand-typing 250 company names yourself. `pandas` is the standard Python tool for tabular data — you'll use it again in Phase 5, so it's worth the familiarity now, on data you already understand.
+- **Why `faker` and `pandas` specifically:** `faker` generates realistic fake data (names, companies, dates) so you're not hand-typing company names yourself. `pandas` is the standard Python tool for tabular data — you'll use it again in Phase 5, so it's worth the familiarity now, on data you already understand.
 - **Why one file, built up in pieces, rather than several small ones:** a Python file runs top to bottom when executed, and a function has to be *defined* before it's *called*. Keeping the three table-generating functions and the code that calls them in one file makes that ordering visible and easy to follow while you're still learning the pattern — you can split it into multiple files later once it feels natural.
 - **Why the specific design choices in the `accounts` table:** an 18-month signup window (not literally today) ensures every account already has some usage history for Phase 5 to analyze. A 15% baseline churn rate gives you a believable mix of active and lost customers. Weighting toward the cheapest tier (50% Basic) mirrors how real SaaS customer bases are actually shaped — most customers on the entry plan, fewer on the expensive one.
-- **Why the "low engagement regions" trick in `usage_events`:** Phase 5's whole analysis depends on there being *some* real pattern buried in this data to find with SQL. If every account behaved identically, there'd be nothing to discover. Making 4 of the 14 regions quietly less engaged — not obviously, just a tendency — is a deliberate puzzle you're setting for your future self.
 - **Why `random.gauss` for the noise:** real usage is never a perfectly flat number every week. Adding Gaussian (bell-curve) noise around an average makes the data look like genuine human behaviour rather than a robotic, obviously-generated pattern.
 - **Why wrap everything in `pandas.DataFrame(...).to_csv(...)` instead of writing the CSV by hand:** the three functions return plain Python lists of dictionaries — accurate, but not something you can easily inspect or save correctly. `pandas` handles the fiddly formatting (commas inside company names, quoting, etc.) that's easy to get wrong doing it manually.
 - **Why verify before moving on, rather than trusting it worked:** catching a problem now — while only one script is involved — is far easier than debugging it three phases later, once it's tangled up with real AWS data too.
@@ -374,7 +407,7 @@ REGIONS = [
     {"region_id": 14, "region_name": "South East England"},
 ]
 ```
-That file is done — you won't touch it again in this phase, only import from it.
+That file is done — you won't touch it again in this phase, only import from it. (It's since grown a second block, `REGION_PROFILE` and `CONSTRAINT_PRONE_REGIONS` — see the addendum at the end of this phase.)
 
 **3. Create `mock_data/generate_data.py`.** 📝 Right-click the `mock_data` folder → **New File** → type `generate_data.py` → Enter. Steps 4-7 below all get typed into *this one file*, top to bottom, in order — you run the whole thing once, at Step 8.
 
@@ -485,6 +518,8 @@ You should see a line like `Generated 250 accounts, 612 users, 71304 events` —
 
 **9. Verify.** Open `mock_data/output/accounts.csv` (click it in VS Code's file explorer to preview it) and check `region_id` spreads across all 14 values, not clustered in two or three. Spot-check `usage_events.csv` shows visibly fewer rows for users in region 1, 2, 6, or 7. If everything looks near-identical, turn the noise/bias numbers up (see the **What** section below for exactly which ones).
 
+> **Note — the version above is the original, first-pass build.** It was superseded shortly after by the realism pass in the **Addendum** below (region-weighted accounts, `properties_served`, `CONSTRAINT_PRONE_REGIONS`, seasonality, financial-year-nudged signups). The **What** section immediately below documents the original version's syntax for learning purposes; the addendum documents what changed and why. The addendum's version is what's actually in the repo.
+
 ### What — argument and concept reference
 
 **`regions.py`:** this is a *list* (square brackets `[ ]`) containing *dictionaries* (each `{ }` entry) — a dictionary is a set of labelled values, like `region_id: 1` paired with `region_name: "North Scotland"`. This shape — a list of dictionaries — is reused throughout `generate_data.py`, and it's exactly what pandas expects when converting to a table in Step 7.
@@ -493,7 +528,7 @@ You should see a line like `Generated 250 accounts, 612 users, 71304 events` —
 - `Faker("en_GB")` — `Faker` is a class from the faker library; calling it creates a "faker object" you ask to generate fake data from. `"en_GB"` is the locale argument — British-style company names/addresses rather than the American default.
 - `random.seed(42)` — one argument, a starting number for the random generator. Any fixed number works; what matters is that the *same* seed always reproduces the *same* "random" data, useful while tuning. Delete this line once you're happy with the results, so future runs are genuinely fresh.
 - `random.choice(REGIONS)` — one argument, a list; returns a single random item from it.
-- `fake.date_between(start_date="-18m", end_date="-1m")` — `start_date`/`end_date` are keyword arguments; Faker accepts relative strings like `"-18m"` (18 months ago) instead of you calculating an actual date.
+- `fake.date_between(start_date="-18m", end_date="-1m")` — `start_date`/`end_date` are keyword arguments; Faker accepts relative strings like `"-18m"` (18 months ago) instead of you calculating an actual date. (This call turned out not to be reliable in practice — see the Phase 1 troubleshooting note and the addendum's `random_date_between` replacement.)
 - `timedelta(days=365)` — a keyword argument specifying a length of time; adding it to a date gives a new date that many days later.
 - `random.random()` — no arguments; returns a decimal between 0 and 1. `< 0.15` turns that into "true 15% of the time."
 - `fake.date_between(...) if churned else None` — not a function argument, a *conditional expression*: "do the first part if `churned` is true, otherwise use `None`."
@@ -519,33 +554,297 @@ You should see a line like `Generated 250 accounts, 612 users, 71304 events` —
 - `.to_csv("mock_data/output/accounts.csv", index=False)` — first argument is the file path; `index=False` (keyword) stops pandas adding its own extra numbering column.
 - `f"Generated {len(accounts)}..."` — the `f` prefix makes this an *f-string*, letting a variable drop straight into text via `{ }`. `len(accounts)` takes one argument (a list) and returns its item count.
 
-**Knobs to adjust, if you want more variety** (all in `generate_data.py`):
-- Region weighting: swap `random.choice(REGIONS)` for `random.choices(REGIONS, weights=[...])` so London/South East get more accounts than North Scotland
-- Seasonality: raise `base_events_per_week` for winter weeks — higher real electricity demand tends to mean more alerts, hence more logins
-- `TIER_WEIGHTS`: shift these so Enterprise accounts get systematically more users/events, not just a higher price
+**Definition of done (original):** three CSVs in `mock_data/output/`, covering a full year, `region_id` as a clean shared key ready to join against NESO data, and a genuine (if noisy) engagement gap between regions for Phase 5 to find.
 
-**Definition of done:** three CSVs in `mock_data/output/`, covering a full year, `region_id` as a clean shared key ready to join against NESO data, and a genuine (if noisy) engagement gap between regions for Phase 5 to find.
+### Troubleshooting note — Faker's relative date strings
+
+The first real run of this script produced every single date (`contract_start_date`, `renewal_date`, `churn_date`, and every `usage_events.event_timestamp`) as the exact same day. The cause: `fake.date_between(start_date="-18m", end_date="-1m")` didn't reliably resolve to an 18-months-to-1-month-ago window in the installed Faker version — it collapsed to essentially "today" every time, and that then cascaded into the calls that depended on it. The fix, carried into the addendum below, was to stop relying on Faker's relative-string date parsing entirely and do the date math directly in Python (`random_date_between`) — more explicit, and not dependent on a specific library version's parsing behaviour.
+
+### Addendum — making the mock data more realistic
+
+After the first working version above, the generator was revisited to ground more of it in real regional data rather than arbitrary choices, prompted by wanting Phase 5's eventual findings to rest on defensible assumptions rather than synthetic guesses — and to correct a scale/domain mismatch (see the note near the top of this guide on `accounts` vs. `properties_served`).
+
+**Why:**
+- **Region-weighted accounts:** real DNO customer counts vary hugely by region — UK Power Networks (London/South East/East England) serves roughly 8 million customers combined; SSEN (North Scotland + Southern England) serves roughly 3.9 million combined, across a much larger, sparser territory. Picking accounts with `random.choice` (uniform across all 14 regions) ignored this entirely. `REGION_PROFILE` in `regions.py` now assigns each region a `population_weight` used to bias `random.choices`, so London/South East/East England get noticeably more accounts than North/South Scotland — not because Scotland is unimportant, but because there are genuinely fewer premises there for a regional ops team to be responsible for. (These weights are a defensible relative ordering, not an exact census — precise per-DNO figures for all 14 regions weren't readily available from a quick research pass.)
+- **`properties_served`:** DNOs' real customers number in the millions, but those are the *properties on the network*, not GridWatch's B2B SaaS customers (the ops teams). Rather than inflating the account count to represent millions of end-consumers — which would misrepresent who GridWatch actually sells to — each account now carries a `properties_served` field: a realistic property count for that team's patch, scaled by the same region tier as the account placement.
+- **`CONSTRAINT_PRONE_REGIONS` (North + South Scotland):** the original arbitrary 4-region "low engagement" set has been replaced with a real, current dynamic — Scotland generates more wind power than the transmission grid can currently export south, and GB-wide constraint (curtailment) payments hit roughly £1.8bn in 2025, up 20% on 2024, disproportionately in Scotland. This is checkable against real data once Phase 2's NESO ingestion is live, rather than being an assertion Phase 1 just makes up.
+- **Winter-weighted usage events:** grid stress and demand both genuinely rise in winter (this is part of why NESO's own demand forecasting has a whole "Average Cold Spell" methodology, simulating thousands of synthetic weather winters). `SEASONAL_MULTIPLIER` biases the expected weekly event count higher in Nov–Feb and lower in Jun–Aug.
+- **Financial-year-nudged signups:** DNOs operate on an April–March financial year under Ofgem's RIIO-ED2 price control (a fixed 5-year settlement, 2023–2028), so B2B software budget decisions plausibly cluster around that reset. `pull_toward_financial_year_start` nudges each account's `contract_start_date` partway toward the nearest 1 April, rather than leaving signups perfectly uniform across the window.
+
+**How — the updated `mock_data/regions.py`** (replaces the Step 2 version above — `REGIONS` is unchanged, this is appended underneath it):
+```python
+# Rough, illustrative weighting for account distribution and account "size"
+# (properties_served), grounded in real regional customer counts where
+# available (UK Power Networks ~8m across London/South East/East England;
+# SSEN ~3.9m across North Scotland + Southern England) and reasonable
+# population-based tiers elsewhere.
+REGION_PROFILE = {
+    1:  {"population_weight": 1, "properties_range": (8, 60)},    # North Scotland
+    2:  {"population_weight": 1, "properties_range": (8, 60)},    # South Scotland
+    3:  {"population_weight": 2, "properties_range": (30, 150)},  # North West England
+    4:  {"population_weight": 1, "properties_range": (10, 70)},   # North East England
+    5:  {"population_weight": 2, "properties_range": (30, 150)},  # South Yorkshire
+    6:  {"population_weight": 1, "properties_range": (10, 70)},   # North Wales, Merseyside and Cheshire
+    7:  {"population_weight": 1, "properties_range": (10, 70)},   # South Wales
+    8:  {"population_weight": 2, "properties_range": (30, 150)},  # West Midlands
+    9:  {"population_weight": 2, "properties_range": (30, 150)},  # East Midlands
+    10: {"population_weight": 3, "properties_range": (80, 400)},  # East England
+    11: {"population_weight": 2, "properties_range": (30, 150)},  # South West England
+    12: {"population_weight": 2, "properties_range": (30, 150)},  # South England
+    13: {"population_weight": 3, "properties_range": (80, 400)},  # London
+    14: {"population_weight": 3, "properties_range": (80, 400)},  # South East England
+}
+
+# Regions carrying the real, disproportionate share of GB's wind curtailment
+# burden — used to bias product engagement lower in these regions.
+CONSTRAINT_PRONE_REGIONS = {1, 2}
+```
+
+**How — the updated `mock_data/generate_data.py`** (replaces Steps 4-7 above in full):
+```python
+import random
+from faker import Faker
+from datetime import date, timedelta
+from regions import REGIONS, REGION_PROFILE, CONSTRAINT_PRONE_REGIONS
+
+fake = Faker("en_GB")
+random.seed(42)
+
+def random_date_between(start, end):
+    """A random calendar date between two dates (inclusive). Uses the
+    already-seeded `random` module directly instead of Faker's relative
+    date-string shorthand — see the troubleshooting note above."""
+    days_between = (end - start).days
+    if days_between <= 0:
+        return start
+    return start + timedelta(days=random.randint(0, days_between))
+
+def pull_toward_financial_year_start(d, earliest, latest, strength=0.35):
+    """Nudges a date some fraction of the way toward the nearest 1 April
+    (the UK utility financial year start), then clamps it back inside the
+    allowed window."""
+    candidates = [date(d.year - 1, 4, 1), date(d.year, 4, 1), date(d.year + 1, 4, 1)]
+    nearest_april = min(candidates, key=lambda c: abs((c - d).days))
+    pulled = d + timedelta(days=int((nearest_april - d).days * strength))
+    return max(earliest, min(latest, pulled))
+
+TIERS = ["Basic", "Pro", "Enterprise"]
+TIER_WEIGHTS = [0.5, 0.35, 0.15]
+
+def generate_accounts(n=450):
+    accounts = []
+    today = date.today()
+    earliest_start = today - timedelta(days=18 * 30)
+    latest_start = today - timedelta(days=30)
+    region_weights = [REGION_PROFILE[r["region_id"]]["population_weight"] for r in REGIONS]
+    for i in range(n):
+        region = random.choices(REGIONS, weights=region_weights)[0]
+        start = random_date_between(earliest_start, latest_start)
+        start = pull_toward_financial_year_start(start, earliest_start, latest_start)
+        renewal = start + timedelta(days=365)
+        churned = random.random() < 0.15
+        churn_date = random_date_between(start, today) if churned else None
+        low_k, high_k = REGION_PROFILE[region["region_id"]]["properties_range"]
+        properties_served = random.randint(low_k * 1000, high_k * 1000)
+        accounts.append({
+            "account_id": i + 1,
+            "account_name": fake.company(),
+            "region_id": region["region_id"],
+            "region_name": region["region_name"],
+            "contract_tier": random.choices(TIERS, weights=TIER_WEIGHTS)[0],
+            "contract_start_date": start,
+            "renewal_date": renewal,
+            "churn_date": churn_date,
+            "properties_served": properties_served,
+        })
+    return accounts
+
+ROLES = ["Network Engineer", "Asset Planner", "Operations Manager", "Data Analyst"]
+
+def generate_users(accounts):
+    users, user_id = [], 1
+    for account in accounts:
+        for _ in range(random.randint(1, 4)):
+            users.append({
+                "user_id": user_id,
+                "account_id": account["account_id"],
+                "role": random.choice(ROLES),
+                "signup_date": account["contract_start_date"],
+            })
+            user_id += 1
+    return users
+
+EVENT_TYPES = ["login", "view_dashboard", "view_alert", "acknowledge_alert", "generate_report"]
+EVENT_WEIGHTS = [0.45, 0.25, 0.15, 0.10, 0.05]
+
+SEASONAL_MULTIPLIER = {
+    1: 1.35, 2: 1.30, 3: 1.15, 4: 1.00, 5: 0.90, 6: 0.85,
+    7: 0.80, 8: 0.80, 9: 0.90, 10: 1.05, 11: 1.25, 12: 1.35,
+}
+
+def generate_usage_events(users, accounts_by_id):
+    events = []
+    today = date.today()
+    for user in users:
+        account = accounts_by_id[user["account_id"]]
+        base_events_per_week = 6
+        if account["region_id"] in CONSTRAINT_PRONE_REGIONS:
+            base_events_per_week *= 0.6
+        week_start = account["contract_start_date"]
+        while week_start <= today:
+            expected = base_events_per_week * SEASONAL_MULTIPLIER[week_start.month]
+            n_events = max(0, int(random.gauss(expected, 2)))
+            for _ in range(n_events):
+                event_date = week_start + timedelta(days=random.randint(0, 6))
+                if event_date > today:
+                    event_date = today
+                events.append({
+                    "user_id": user["user_id"],
+                    "event_timestamp": event_date,
+                    "event_type": random.choices(EVENT_TYPES, weights=EVENT_WEIGHTS)[0],
+                })
+            week_start += timedelta(days=7)
+    return events
+
+import pandas as pd
+
+accounts = generate_accounts(450)
+users = generate_users(accounts)
+accounts_by_id = {a["account_id"]: a for a in accounts}
+events = generate_usage_events(users, accounts_by_id)
+
+pd.DataFrame(accounts).to_csv("mock_data/output/accounts.csv", index=False)
+pd.DataFrame(users).to_csv("mock_data/output/users.csv", index=False)
+pd.DataFrame(events).to_csv("mock_data/output/usage_events.csv", index=False)
+print(f"Generated {len(accounts)} accounts, {len(users)} users, {len(events)} events")
+```
+
+**A data-quality nuance worth knowing about, not a bug:** if you group `usage_events` by raw calendar month, the winter-weighting doesn't visually jump out — Jun/Jul actually look busiest in a raw count. That's because the account base itself grows fast over the 18-month window (far more accounts exist by month 12 than by month 1), and that growth swamps the seasonal signal in a raw total. Normalize by the number of *active* accounts in each month (events ÷ active users that month) and the intended winter peak reappears clearly — events-per-active-user rises through autumn, peaks around Nov–Jan, and falls back over spring/summer. This is a genuinely realistic wrinkle (real SaaS usage data has exactly this "growth vs. seasonality" confound) and a legitimate thing to handle explicitly in the Phase 5 SQL — e.g. normalizing by active accounts, or comparing accounts of similar tenure — rather than something to fix away here.
+
+**Also worth knowing:** the financial-year pull can produce a visibly "twin-peaked" `contract_start_date` distribution rather than one smooth bump around a single April — since the 18-month window spans two separate 1 April dates, dates roughly equidistant between them (around Aug–Nov) get pulled toward whichever April is nearer, thinning out that middle stretch more than a single-peak intuition would expect. This is a real, explainable consequence of the pull logic (not a bug), and arguably a *better* story than a single bump: two waves of signups, each shortly after a financial-year reset.
+
+**What — new fields/concepts in the addendum:**
+- `properties_served` (accounts.csv) — approximate real-world property count covered by that account's operational patch, scaled by the region's customer-density tier.
+- `REGION_PROFILE` (regions.py) — per-region `population_weight` (biases account placement via `random.choices`) and `properties_range` (bounds `properties_served`, in thousands).
+- `CONSTRAINT_PRONE_REGIONS` (regions.py) — replaces `LOW_ENGAGEMENT_REGIONS`; currently `{1, 2}` (North + South Scotland).
+- `pull_toward_financial_year_start()` — nudges a date a configurable fraction (`strength`) of the way toward the nearest 1 April, then clamps back inside the allowed window.
+- `SEASONAL_MULTIPLIER` — a per-calendar-month (1–12) multiplier applied to the expected weekly event count in `generate_usage_events`.
+- The usage-events loop now walks real calendar weeks (`while week_start <= today: ... week_start += timedelta(days=7)`) from each account's actual start date, rather than a fixed `range(52)` — this is what makes the seasonal multiplier meaningful (each batch of events is now tied to a real calendar month) and also means an account's total event count naturally reflects how long it's actually been a customer.
+
+**Definition of done (updated):** 450 accounts spread across all 14 regions with realistic relative weighting, `properties_served` populated and scaled sensibly by region, a clear engagement gap between Scotland and the rest, contract signings visibly clustered near financial-year resets, and a winter usage peak that shows up once normalized by active account count.
 
 ## Phase 2 — Real data ingestion (Lambda + Step Functions → S3)
 
-**What you're building:** scheduled ingestion of real transmission-level grid data, landing as raw JSON/CSV in S3. Starting with a single source keeps this phase tractable — distribution-level data comes in as a natural extension once this pipeline pattern is proven, not as a blocker to getting something working end-to-end.
+### Why
 
-**Data source — transmission-level (start here):**
-- **NESO (National Energy System Operator) Data Portal & Carbon Intensity API** — GB-wide (GB = Great Britain here, not gigabyte) and regional demand, generation mix, carbon intensity, and balancing/constraint data. No authentication required, and its ~14 regions give you a genuine "region" dimension for the Phase 5 analysis without needing a second source yet.
+- **Why the Carbon Intensity API's `/regional` endpoint specifically:** one call returns all 14 DNO regions (plus England/Scotland/Wales/GB aggregates — 18 entries total) in a single JSON response — confirmed live and unchanged in structure from what the guide originally assumed. Each region entry carries a stable `regionid` (1–14 for the DNO regions) that lines up exactly with Phase 1's `region_id`, plus `dnoregion`/`shortname` (matching your region names), `intensity` (forecast + index), and `generationmix` (fuel type breakdown). No API key, no auth — one HTTP GET is the whole integration.
+- **Why store all 18 entries, unfiltered, in the raw zone:** the 4 aggregate entries (England/Scotland/Wales/GB) don't have a matching `region_id` in Phase 1's accounts table, so they're not useful for the Phase 5 join — but the raw zone's whole purpose is to hold exactly what the API returned, unmodified. Deciding what to keep and what to drop is Phase 3's job (the transform layer), not the ingestion Lambda's. Keeping the Lambda "dumb" (fetch, validate it's JSON, write it, done) means there's only one place business logic can go wrong, and it isn't here.
+- **Why `urllib.request` instead of the more common `requests` library:** AWS Lambda's Python runtimes ship with `boto3`/`botocore` pre-installed, but *not* `requests` — using it would mean packaging a dependency into a zip file and uploading that, instead of just pasting code into the console's built-in editor. `urllib` is part of Python's standard library, so it needs zero extra packaging — for a first Lambda, that's one less thing that can go wrong, and it means you can build this entirely through the AWS Console with no zip files at all.
+- **Why a separate S3 key per fetch, timestamped down to the second** (`raw/neso-demand/2026-08-17/2026-08-17T14-30-00.json`): S3 objects are immutable by key — writing to the same key twice overwrites the first one. A unique timestamped key per invocation means every historical fetch is preserved, which is exactly what you want for a time-series dataset like this.
+- **Why Step Functions wraps a single Lambda, rather than just scheduling the Lambda directly:** you could trigger the Lambda straight from EventBridge with no Step Functions involved — it would work. Wrapping it adds automatic retries (the API being briefly unavailable shouldn't mean a missed day of data) and a visual execution history you can screenshot for your portfolio, at basically zero extra cost (Step Functions' 4,000 free monthly state transitions comfortably covers a Lambda you're calling once a day or even every 30 minutes). It's also exactly where the distribution-level Lambda plugs in later, as a second branch in the same workflow — not a decision you want to retrofit once you're already scaling this into a multi-branch workflow.
+- **Why daily to start, not the full 30-minute settlement-period cadence:** the guide's Phase 2 plan mentions both. Daily is the better starting cadence while you're learning the AWS console — fewer executions to reason about while you're checking things work, comfortably inside every free-tier limit, and trivial to tighten to 30 minutes later (it's one field in the EventBridge schedule, not a code change).
+- **Why the AWS Console's inline code editor rather than a zip upload or the AWS Toolkit's deploy feature:** given `urllib`+`boto3` need no extra packaging, pasting the code directly into the Lambda console's editor is the simplest possible deploy path for a first Lambda — no zip file, no packaging step, no AWS Toolkit deploy configuration to get right. Worth revisiting once you're comfortable and want a faster edit-deploy loop (the Toolkit can deploy straight from VS Code), but not necessary for this first pass.
 
-**Distribution-level data — add later, as a Phase 2 extension:**
-- **UK Power Networks Smart Meter Consumption (Open Data)** — aggregated half-hourly consumption at substation/LV feeder level. Once the transmission pipeline is working, add this the same way: another Lambda, another branch in the Step Functions workflow, another prefix in S3. It deepens the "network stress" picture from regional down to substation level.
+### How
 
-*(Optional further stretch: Elexon's Insights Solution/BMRS (Balancing Mechanism Reporting Service) APIs add settlement-level pricing and balancing-cost data eventually — not required for the core story.)*
+**1. The code is already written into your repo** (I've placed it there directly): `ingestion/lambdas/neso_ingest/handler.py` and a placeholder `requirements.txt` (empty — no third-party dependencies needed, see Why above) plus `infra/neso_ingest_state_machine.json` (the Step Functions definition). 📝 Open `ingestion/lambdas/neso_ingest/handler.py` in VS Code to read through it before deploying anything — it's short, and worth understanding line by line before it's running unattended on a schedule.
 
-**How (for the NESO source):**
-1. Write a Lambda function (Python) that calls the API and writes the raw response to S3, keyed by date — e.g. `raw/neso-demand/2026-08-15.json`.
-2. Wrap it in a **Step Functions Standard workflow** — even a single-Lambda workflow is worth doing properly here, since it gives you retry/error handling and a visual execution graph, and it's exactly where you'll plug in the distribution branch later.
-3. Trigger it on a schedule via **EventBridge** — every 30 minutes to match settlement periods, or daily if you'd rather keep volume low while learning.
+**2. Create the S3 bucket.**
+🌐 **Browser (AWS Console):**
+1. Search "S3" in the top search bar → **Create bucket**
+2. Bucket name: something globally unique, e.g. `gridwatch-raw-<your-name-or-a-few-random-characters>` (S3 bucket names are unique across *all* of AWS, not just your account, so a plain name like `gridwatch-raw` will almost certainly already be taken)
+3. AWS Region: **eu-west-2 (London)** — matches the region you set in `aws configure` back in Section 1.1
+4. Leave **Block all public access** ticked (the default) — this data should never be public
+5. Leave everything else default → **Create bucket**
+6. Note the exact bucket name down somewhere — you'll paste it into the Lambda code next
 
-**Free-tier math:** even at hourly frequency you're around 700-750 invocations per month — nowhere near the 1M free requests. Daily Step Functions runs land around 30 transitions/month, well under the 4,000 free limit.
+**3. Update the placeholder bucket name in the Lambda code.**
+📝 **File — `ingestion/lambdas/neso_ingest/handler.py`:** find the line `S3_BUCKET = "your-bucket-name"` near the top and replace `"your-bucket-name"` with the exact bucket name from Step 2. Save.
 
-**Definition of done:** raw NESO data landing reliably in S3 on schedule, with a Step Functions execution graph you can screenshot for your portfolio.
+**4. Create the Lambda function.**
+🌐 **Browser (AWS Console):**
+1. Search "Lambda" → **Create function**
+2. Choose **Author from scratch**
+3. Function name: `gridwatch-neso-ingest`
+4. Runtime: the newest available **Python 3.x** option
+5. Leave **Create a new role with basic Lambda permissions** selected — this auto-generates an execution role with just CloudWatch Logs write access; you'll add S3 access to it next
+6. **Create function**
+
+**5. Paste in your code and deploy.**
+🌐 **Browser (AWS Console), on the function's page:**
+1. Scroll to the **Code source** panel (should already be open on the **Code** tab)
+2. Select all the boilerplate code AWS pre-filled and delete it
+3. Paste in the full contents of your (now bucket-name-updated) `ingestion/lambdas/neso_ingest/handler.py`
+4. Click **Deploy** (orange button above the editor) — this is the step that actually makes your pasted code live; nothing runs until you click it
+
+**6. Give the Lambda permission to write to your S3 bucket.** By default, the auto-created role can only write logs — it has no S3 access at all yet.
+🌐 **Browser (AWS Console):**
+1. On the Lambda function's page, click the **Configuration** tab → **Permissions** (left-hand list)
+2. Click the role name under **Execution role** — this opens IAM in a new tab, already on that role's page
+3. Click **Add permissions** → **Create inline policy**
+4. Switch to the **JSON** editor tab and paste:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::your-bucket-name/*"
+    }
+  ]
+}
+```
+(replace `your-bucket-name` with your real bucket name from Step 2 — keep the `/*` at the end, it means "any object inside this bucket")
+5. Click **Next**, give the policy a name like `gridwatch-neso-ingest-s3-write`, then **Create policy**
+
+**7. Test it manually, before scheduling anything.**
+🌐 **Browser (AWS Console), back on the Lambda function's page:**
+1. Click the **Test** tab
+2. **Event name:** anything, e.g. `manual-test`. Leave the JSON body as the default template (`{}`) — this Lambda ignores its input entirely, it always does the same thing
+3. Click **Save**, then click **Test**
+4. You should see **Execution result: succeeded**, with a response showing the `bucket` and `key` your function wrote to
+5. Confirm it for real: search "S3" → open your bucket → browse into `raw/neso-demand/` → you should see today's date folder, and inside it a `.json` file. Open it (Download, or click **Open**) and check it looks like real Carbon Intensity data — a `data` array containing a `regions` array with 18 entries
+
+**8. Create the Step Functions state machine.** First, find your AWS account ID (you'll need it for the next step): 🖥️ **Terminal:** `aws sts get-caller-identity` — the `Account` field in the output.
+🌐 **Browser (AWS Console):**
+1. Search "Step Functions" → **State machines** → **Create state machine**
+2. Choose to write it in code (look for **Code** / **Definition** as the editing mode, rather than the visual drag-and-drop designer)
+3. Paste in the contents of `infra/neso_ingest_state_machine.json`, but first replace `YOUR_ACCOUNT_ID` in that ARN with your real account ID from the command above (leave `eu-west-2` and `gridwatch-neso-ingest` as they are, assuming you named things exactly as above)
+4. Type: **Standard**
+5. Name: `gridwatch-neso-ingestion`
+6. When asked about permissions, let it **create a new IAM role** — Step Functions will detect the Lambda referenced in your definition and generate a role scoped to invoke just that function
+7. **Create state machine**
+
+**9. Test the state machine.**
+🌐 **Browser (AWS Console), on the state machine's page:**
+1. Click **Start execution** → leave the input as the default `{}` → **Start execution**
+2. Watch the execution graph — the single state should turn green (succeeded) within a few seconds
+3. Check S3 again for a new object — confirms the whole chain (Step Functions → Lambda → S3) works end to end
+
+**10. Schedule it with EventBridge.**
+🌐 **Browser (AWS Console):**
+1. Search "EventBridge" → look for **Scheduler** in the left-hand navigation (the newer, more flexible way to schedule things — if your console shows a different layout by the time you're doing this, search for "schedule" or "rule" and look for anything that lets you target a Step Functions state machine on a timer)
+2. **Create schedule**
+3. Name: `gridwatch-neso-daily`
+4. Schedule pattern: **Recurring schedule** → rate-based, **1 day** (you can tighten this to a 30-minute cadence later — see the Why section)
+5. Target: **Step Functions** → **StartExecution** → select `gridwatch-neso-ingestion`
+6. Permissions: let it auto-create the role needed to start the state machine
+7. **Create schedule**
+
+**11. Verify end to end, then commit.** Wait for the next scheduled run (or trigger it manually the same way as Step 9 to confirm sooner), check S3 for the new object, then commit `ingestion/` and `infra/` to a feature branch and merge — same pattern as Phase 1.
+
+**Definition of done:** raw NESO data landing reliably in S3 on a schedule with no manual intervention, a Step Functions execution graph you can screenshot for your portfolio, and both the Lambda code and the state machine definition version-controlled in the repo as infrastructure-as-code.
+
+### What — argument and concept reference
+
+- **ARN (Amazon Resource Name)** — AWS's unique identifier format for any resource, e.g. `arn:aws:lambda:eu-west-2:123456789012:function:gridwatch-neso-ingest` — service (`lambda`), region, account ID, resource type and name, in that order. The Step Functions definition needs your Lambda's exact ARN to know what to invoke.
+- **IAM inline policy** — a permissions policy attached directly to one specific role, rather than a reusable "managed policy" you might attach to many roles. Fine for a single-purpose role like this Lambda's.
+- **`s3:PutObject`** — the specific IAM permission for writing a new object to S3; narrower than blanket S3 access, and scoped further here to just your one bucket via the `Resource` ARN.
+- **Amazon States Language (ASL)** — the JSON-based language Step Functions state machine definitions are written in. `StartAt` names the first state; `States` is a dictionary of every state in the workflow, keyed by name; `Type: "Task"` means "run something" (here, invoke a Lambda); `End: true` marks a state as the workflow's last step.
+- **`Retry` block** — `ErrorEquals: ["States.ALL"]` matches any error type; `IntervalSeconds`/`MaxAttempts`/`BackoffRate` control how long to wait before retrying, how many times, and how much longer to wait after each failed attempt (exponential backoff).
+- **EventBridge Scheduler** — AWS's dedicated scheduling service (distinct from the older "EventBridge Rules" you may see referenced elsewhere) for triggering something — here, a Step Functions execution — on a recurring or one-off schedule.
+- **Execution role** — the IAM role a Lambda function (or state machine) runs as; determines what AWS resources it's allowed to touch, separately from your own IAM user's permissions.
 
 ## Phase 3 — Transform (cost-aware Glue → curated S3)
 
@@ -555,7 +854,7 @@ You should see a line like `Generated 250 accounts, 612 users, 71304 events` —
 - **Recommended path:** use a **Glue Python Shell job** (not Spark) at the smallest DPU setting (0.0625 DPU). This is the cheapest Glue compute option — a fraction of a penny per short run — and still gives you real, CV-legitimate Glue experience. Trigger it as the next step in your Step Functions workflow.
 - **Alternative if you want strictly £0:** do the transform inside the same Lambda functions from Phase 2 (pandas/pyarrow) instead, and run a **Glue Crawler** occasionally just to register schemas in the (free) Data Catalog. Noting in your write-up that you evaluated the Glue-vs-Lambda cost trade-off and made a deliberate choice is itself a legitimate, CV-worthy architectural decision.
 
-**What the transform does either way:** parse raw JSON/CSV, handle missing or malformed readings, cast types correctly, convert settlement periods to proper timestamps, and write out as **partitioned Parquet** (partitioned by date) into a `curated/` S3 prefix.
+**What the transform does either way:** parse raw JSON/CSV, handle missing or malformed readings, filter Phase 2's raw feed down to just the 14 real DNO regions (dropping the England/Scotland/Wales/GB aggregate entries, which don't have a matching `region_id` in Phase 1's data), cast types correctly, convert settlement periods to proper timestamps, and write out as **partitioned Parquet** (partitioned by date) into a `curated/` S3 prefix.
 
 **An honesty note for later:** you won't have access to real substation capacity thresholds (that's internal DNO data), so "stress" in this project should be framed as a *relative* measure — e.g. top-percentile load periods for a given substation/region — rather than claiming to know true remaining capacity. Say this explicitly in your write-up; it reads as more credible, not less.
 
@@ -582,7 +881,7 @@ bq mk --dataset --location=europe-west2 your-project-id:gridwatch
 🖥️ **Terminal:**
 ```
 bq mk --table your-project-id:gridwatch.dim_region region_id:INTEGER,region_name:STRING
-bq mk --table your-project-id:gridwatch.accounts account_id:INTEGER,account_name:STRING,region_id:INTEGER,contract_tier:STRING,contract_start_date:DATE,renewal_date:DATE,churn_date:DATE
+bq mk --table your-project-id:gridwatch.accounts account_id:INTEGER,account_name:STRING,region_id:INTEGER,contract_tier:STRING,contract_start_date:DATE,renewal_date:DATE,churn_date:DATE,properties_served:INTEGER
 ```
 (repeat the pattern for `users` and `usage_events`, matching the columns from Phase 1's CSVs)
 
@@ -614,7 +913,7 @@ The core "data analysis and manipulation" competency shows up here. Suggested qu
 2. **Engagement gap:** do accounts responsible for higher-stress regions show higher or lower product engagement (logins, alert acknowledgements) than accounts in lower-stress regions?
 3. **Renewal risk:** is there a relationship between low engagement and non-renewal (churn) — specifically, are disengaged accounts in high-stress regions a renewal risk despite being the customers who most need the product?
 
-Techniques you'll naturally end up using: window functions for cohort/retention analysis, joins across your fact tables, CTEs (Common Table Expressions — named, temporary result sets that break a complex query into readable steps) to keep multi-step logic readable, and date bucketing to align usage events with settlement periods.
+Techniques you'll naturally end up using: window functions for cohort/retention analysis, joins across your fact tables, CTEs (Common Table Expressions — named, temporary result sets that break a complex query into readable steps) to keep multi-step logic readable, and date bucketing to align usage events with settlement periods. Given the Phase 1 addendum's growth-vs-seasonality confound (see above), normalizing engagement metrics by active account count or account tenure will likely matter here too, not just for usage-event seasonality.
 
 **Definition of done:** a small set of saved SQL queries with clear, written-up findings. A null result ("no strong relationship found") is a legitimate and honest finding — don't feel pressure to manufacture a stronger story than the data supports.
 
@@ -654,6 +953,8 @@ Terms you'll run into throughout this guide and in day-to-day data engineering w
 - **Carbon intensity** — how much CO2 is produced per unit of electricity generated at a given moment; it changes constantly as the generation mix (wind/solar/gas/etc.) shifts.
 - **Settlement period** — the 30-minute windows GB's electricity market is priced and balanced in.
 - **GSP (Grid Supply Point)** — the physical point where the national transmission network connects into a regional distribution network.
+- **Curtailment / constraint payments** — paying a generator (typically a wind farm) to reduce or stop output because the transmission grid can't carry all the power it's producing to where it's needed. GB-wide constraint costs were roughly £1.5bn in 2024 and £1.8bn in 2025, with Scotland accounting for a disproportionate share due to high wind generation outpacing north-south transmission capacity.
+- **RIIO-ED2** — Ofgem's current electricity distribution price control period (2023–2028), setting the ~£22bn of allowed DNO investment and, by extension, DNOs' 5-year capital/budget planning cycle.
 
 ## Business / SaaS
 - **SaaS (Software as a Service)** — a business model where customers pay an ongoing subscription to use software hosted by someone else, rather than buying and installing it themselves.
@@ -690,3 +991,5 @@ Terms you'll run into throughout this guide and in day-to-day data engineering w
 - **Push / pull** — sending your local commits up to GitHub (push), or bringing down others' commits from GitHub (pull).
 - **Stage / staging (in Git)** — marking specific changes as "ready to be included in the next commit." Note this is a different meaning to the "staging zone" in data engineering above — same word, different context.
 - **Branch** — a parallel, independent line of changes in a repo, typically used to build something without affecting the main version until it's ready.
+- **Merge** — folding one branch's commits into another (typically a feature branch back into `main`).
+- **Pull request (PR)** — a GitHub page proposing that one branch be merged into another, showing the diff and allowing comments, before the merge actually happens.
