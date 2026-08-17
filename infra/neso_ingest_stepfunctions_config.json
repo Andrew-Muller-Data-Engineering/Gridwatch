@@ -5,6 +5,7 @@
   "region": "eu-west-2",
   "lambda_function_name": "gridwatch-neso-ingest",
   "glue_job_name": "gridwatch-neso-transform",
+  "bigquery_load_lambda_function_name": "gridwatch-bigquery-load",
   "schedule_name": "gridwatch-neso-daily",
   "schedule_role_name": "gridwatch-neso-daily-schedule-role",
   "schedule_expression": "cron(0 9 * * ? *)",

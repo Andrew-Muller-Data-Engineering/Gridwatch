@@ -913,48 +913,131 @@ Same command you've run before — this time it updates the state machine's defi
 
 ## Phase 4 — Load into BigQuery (star schema)
 
-**What you're building:** the analytical warehouse.
+### Why
 
-**Schema** (using `region_id` throughout as the shared key from Phase 1):
-- `fact_network_readings`: timestamp, region_id, demand_or_consumption, generation_mix, carbon_intensity, relative_load_percentile
-- `fact_user_engagement`: user_id, timestamp, event_type
-- `dim_date`, `dim_region` (region_id, region_name), `dim_account`, `dim_user`
+- **Why this phase is genuinely different from Phases 1-3:** every AWS resource so far stayed inside one cloud — the whole question was "deploy this correctly," never "how does data physically get from A to B." Phase 4 needs data to cross from AWS (S3) into GCP (BigQuery), and the two clouds don't share storage — there's no path that doesn't involve an explicit hop through Google Cloud Storage (GCS) first, since BigQuery can only load from GCS, not directly from S3.
+- **Why a plain script over BigQuery Omni or GCP's Storage Transfer Service:** both real alternatives, both rejected on the same cost/complexity grounds that shaped the Glue-vs-Spark decision in Phase 3. BigQuery Omni would let BigQuery query the S3 Parquet in place, with no data movement at all — elegant, but it requires BigQuery Enterprise/Enterprise Plus edition, real ongoing cost outside this project's always-free approach. GCP's Storage Transfer Service would pull from S3 on a schedule with no custom code — but it needs your AWS access keys stored as a GCP credential (a second long-lived cross-cloud secret, on top of the one this phase already needed) and has its own scheduling/cost model, for not much benefit at this data volume. A script following the same config-plus-deploy-script habit as everything else in this project was the better fit.
+- **Why the destination table is called `fact_carbon_intensity_readings`, not the `fact_network_readings` this section originally sketched:** that draft was written before any real data existed, and proposed a `demand_or_consumption` column the Carbon Intensity API doesn't actually provide — only carbon intensity and generation mix. Naming the table for what it actually contains, rather than leaving a stale aspirational name in place, matches the same "the real data is the source of truth, not the plan" principle Phase 3's actual column set already followed.
+- **Why `relative_load_percentile` isn't a stored column:** it's a derived measure — a reading's value relative to other readings — which belongs in Phase 5's SQL, computed at query time, not duplicated as a stale stored value that would need recomputing every time new data lands.
+- **Why the bridge script needed a two-stage build (manual first, then automated) rather than going straight to automation:** the manual version (`warehouse/load_curated_to_bigquery.py`, run from your own laptop) let the actual cross-cloud logic — copy from S3, re-upload to GCS, load into BigQuery — get proven correct against real data with fast iteration and a human reading every error message. Automating it as a Lambda afterward meant the *logic* was already trusted, and the remaining work was purely "how does a cloud-hosted job authenticate to a second cloud" — a cleanly separated, genuinely different problem, easier to solve on its own than tangled up with debugging the transform logic at the same time.
+- **Why the manual script has no IAM role, unlike every other deploy script:** Lambda, Step Functions, and Glue all needed a role because the resource itself runs *in the cloud* and needs its own identity. The manual script runs on your own laptop, using identities you already have — your AWS IAM user (`aws configure`, Part 1.1) for S3, and Google's Application Default Credentials (a separate login from the `gcloud` CLI's own — see the "gcloud has two logins" note below) for GCS and BigQuery.
+- **Why the automated Lambda authenticates via a service account key in Secrets Manager, not Workload Identity Federation:** WIF is the more modern, keyless approach — no long-lived secret ever stored anywhere, since the Lambda would exchange its own short-lived AWS credentials for a short-lived GCP token at request time. It's genuinely the better long-term answer, and worth knowing exists. It was set aside here for a simpler, faster-to-get-working first version: a service account key, stored in AWS Secrets Manager, fetched by the Lambda at runtime and never written to disk. The trade-off is real and worth naming plainly — a static key is a long-lived credential that works until manually rotated, even if it leaked. (Notably, Google itself now defaults newer projects to *blocking* key creation entirely, specifically to push people toward WIF — see the troubleshooting note below for how that actually played out.)
+- **Why the Lambda's own deploy script is more complex than the earlier two Lambda deploys:** `deploy_neso_ingest.py` only ever zipped `handler.py` itself, since Lambda's runtime already includes everything that Lambda needed (`boto3`, the standard library). This Lambda also needs `google-cloud-storage` and `google-cloud-bigquery`, which aren't part of any Lambda runtime — so `deploy_bigquery_load_lambda.py` has to `pip install` them into a build folder *targeting Lambda's own Linux environment specifically* (not whatever OS you're running the deploy script on) before zipping anything, and then check whether the result is small enough to upload directly (Lambda's inline-upload limit is 50MB compressed) or needs uploading to S3 first instead (a much higher limit applies when Lambda loads code from S3).
 
-**Step-by-step** (you can start this with just Phase 1's CSVs, before the AWS side is built — good way to start practicing SQL early):
+### How
 
-**1. Create your dataset**, if you haven't already:
-🖥️ **Terminal:**
+**Loading Phase 1's mock CSVs** — unchanged from the original plan, and independent of everything else in this phase:
+
+**1.** 🖥️ **Terminal** (`.venv` activated, inside `gridwatch`), create the tables with explicit schemas (safer than letting BigQuery guess types from a CSV):
 ```
-bq mk --dataset --location=europe-west2 your-project-id:gridwatch
+bq mk --table your-project-id:gridwatch.accounts account_id:INTEGER,account_name:STRING,region_id:INTEGER,region_name:STRING,contract_tier:STRING,contract_start_date:DATE,renewal_date:DATE,churn_date:DATE,properties_served:INTEGER
+bq mk --table your-project-id:gridwatch.users user_id:INTEGER,account_id:INTEGER,role:STRING,signup_date:DATE
+bq mk --table your-project-id:gridwatch.usage_events user_id:INTEGER,event_timestamp:DATE,event_type:STRING
 ```
+(the dataset itself, `gridwatch`, gets created automatically the first time either the manual or automated load script runs — see below — so there's no separate `bq mk --dataset` step needed if you do this phase in the order below)
 
-**2. Create the tables with an explicit schema** — safer than letting BigQuery auto-detect types from a CSV, which sometimes guesses wrong:
-🖥️ **Terminal:**
-```
-bq mk --table your-project-id:gridwatch.dim_region region_id:INTEGER,region_name:STRING
-bq mk --table your-project-id:gridwatch.accounts account_id:INTEGER,account_name:STRING,region_id:INTEGER,contract_tier:STRING,contract_start_date:DATE,renewal_date:DATE,churn_date:DATE,properties_served:INTEGER
-```
-(repeat the pattern for `users` and `usage_events`, matching the columns from Phase 1's CSVs)
-
-**3. Load the CSVs directly:**
-🖥️ **Terminal:**
+**2. Load the CSVs:**
 ```
 bq load --source_format=CSV --skip_leading_rows=1 your-project-id:gridwatch.accounts mock_data/output/accounts.csv
+bq load --source_format=CSV --skip_leading_rows=1 your-project-id:gridwatch.users mock_data/output/users.csv
+bq load --source_format=CSV --skip_leading_rows=1 your-project-id:gridwatch.usage_events mock_data/output/usage_events.csv
 ```
-Repeat for `users.csv` and `usage_events.csv`.
 
-**4. Verify it loaded correctly:**
-🖥️ **Terminal:**
+**3. Verify the join key:**
 ```
 bq query --use_legacy_sql=false 'SELECT region_id, COUNT(*) AS accounts FROM `your-project-id.gridwatch.accounts` GROUP BY region_id ORDER BY region_id'
 ```
-You should see all 14 `region_id` values represented — matching what you checked in Phase 1, Step 8.
+All 14 `region_id` values should appear, same set `fact_carbon_intensity_readings` uses below — confirming Phase 1's mock data and the real NESO data can actually be joined in Phase 5.
 
-**5. Later, once real NESO/curated data lands from the AWS side (Phase 2/3):** load it the same way, but point `bq load` at a `gs://your-bucket/...` path with `--source_format=PARQUET` instead of a local CSV.
+**Bridging the real curated data — manual version first:**
 
-Partitioning and clustering by date is worth setting up once you're loading real time-series data — for the mostly-static `accounts`/`users` tables from Phase 1, it isn't necessary yet.
+**4. Set up GCP tooling**, if this is the first time you've actually used it in this project:
+- Install the two Python packages the bridge script needs: 🖥️ **Terminal** — `pip install google-cloud-storage google-cloud-bigquery`
+- **`gcloud` has two separate logins, and you need both.** `gcloud auth login` authenticates the `gcloud` command-line tool itself (needed for commands like `gcloud projects list`). `gcloud auth application-default login` separately authenticates any Python code using Google's client libraries (needed for the script itself to run). Run both if you haven't already:
+```
+gcloud auth login
+gcloud auth application-default login
+```
+- If `gcloud` itself isn't found at all, it's likely a PATH issue rather than a missing install — check `ls ~/google-cloud-sdk` first; if that folder exists, run `source "$HOME/google-cloud-sdk/path.zsh.inc"` to load it into your current terminal, then add that line to `~/.zshrc` so future terminal windows pick it up automatically.
+- Find your project ID: `gcloud config get-value project`. If that comes back `(unset)`, list your projects with `gcloud projects list` and set one as default with `gcloud config set project YOUR_PROJECT_ID` — use the value under the `PROJECT_ID` column specifically, not `NAME` or `PROJECT_NUMBER`.
 
-**Definition of done:** all three Phase 1 tables queryable in BigQuery, with the `region_id` GROUP BY confirming the join key lines up cleanly, comfortably inside the 10 GB free storage limit.
+**5. Create a GCS bucket** to hold the bridged data (bucket names are globally unique, same rule as S3):
+```
+gcloud storage buckets create gs://gridwatch-curated-andy817 --project=YOUR_PROJECT_ID --location=europe-west2
+```
+
+**6.** 📝 **File — `warehouse/bigquery_load_config.json`:** set `gcp_project_id` and `gcs_bucket` to match what you just found/created.
+
+**7. Run it:**
+```
+python warehouse/load_curated_to_bigquery.py
+```
+This copies today's curated Parquet partition from S3 to GCS, then loads it into BigQuery — creating the `gridwatch` dataset and the `fact_carbon_intensity_readings` table automatically on first run (Parquet files carry their own schema, so BigQuery reads column names and types straight from the file, no manual `bq mk --table` needed for this one).
+
+**A schema bug this phase caught, worth knowing about even though it's already fixed:** the first attempt at this failed with *"The field specified for partitioning cannot be found in the schema"*, then, once fixed, *"...can only be of type TIMESTAMP, DATETIME, or DATE. The type found is: STRING."* Both were bugs in Phase 3's Glue script, only surfaced once Phase 4 tried to actually use the `reading_date` column: `pyarrow`'s own `write_to_dataset(..., partition_cols=[...])` strips the partition column out of each file once it's encoded in the folder name (fixed by writing each partition's file manually, keeping the column), and the column had been stored as a plain string rather than a real date value (fixed by removing an unnecessary `.astype(str)`). `transform/glue_jobs/clean_neso_data.py`, as currently in the repo, already has both fixes — mentioned here because it's a good example of a bug that couldn't have been caught by Phase 3 alone, since Phase 3's own "definition of done" (a Parquet file lands in S3) doesn't test whether a *different* system can actually make use of what's in it.
+
+**8. Sanity-check the loaded data**, the BigQuery equivalent of Phase 1's region-spread check:
+```sql
+SELECT COUNT(*) AS total_rows,
+  COUNTIF(ABS(biomass_pct + coal_pct + imports_pct + gas_pct + nuclear_pct + other_pct + hydro_pct + solar_pct + wind_pct - 100) > 0.5) AS rows_off_by_more_than_0_5pct
+FROM `your-project-id.gridwatch.fact_carbon_intensity_readings`
+```
+`rows_off_by_more_than_0_5pct` should come back 0 — a small tolerance rather than exact-100 equality, since the source API rounds each fuel percentage to one decimal place, and summing several independently-rounded values can drift a few tenths either side of exactly 100 without anything actually being wrong.
+
+**Automating it — a third Lambda, chained onto the existing workflow:**
+
+**9. One-time setup: a GCP service account, and its key in AWS Secrets Manager.** 🖥️ **Terminal** (replace `YOUR_PROJECT_ID` throughout):
+```
+gcloud iam service-accounts create gridwatch-loader --display-name="GridWatch BigQuery Loader" --project=YOUR_PROJECT_ID
+gcloud storage buckets add-iam-policy-binding gs://gridwatch-curated-andy817 --member="serviceAccount:gridwatch-loader@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/storage.objectAdmin"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:gridwatch-loader@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/bigquery.jobUser"
+```
+For the dataset's own edit access, use the BigQuery console's **Sharing** button on the `gridwatch` dataset → **Add principal** → the service account's email → role **BigQuery Data Editor** — the newer `bq add-iam-policy-binding` command for datasets is gated behind a Google allowlist on many projects (it was on this one), so the console's own sharing UI is the more reliable path.
+
+**Note on GCS roles:** `roles/storage.objectAdmin`, not the narrower `roles/storage.objectCreator` — the daily job re-runs against the same file each day (see Phase 3's fixed-filename change), so it needs to *overwrite* an existing object, not just create new ones. GCS treats overwriting as requiring delete permission on the previous version, which `objectCreator` deliberately doesn't grant.
+
+**10. Generate the key and store it in Secrets Manager.** If `gcloud iam service-accounts keys create ...` fails with `FAILED_PRECONDITION: Key creation is not allowed on this service account` (a real, increasingly common default on newer GCP projects, specifically meant to push you toward Workload Identity Federation instead), try overriding the **Disable service account key creation** organization policy for your project via the console first — if that's not available to you either (locked above your project, not uncommon on personal accounts), generate the key from the console instead: IAM & Admin → **Service Accounts** → the account → **Keys** tab → **Add Key** → **Create new key** → JSON. Wherever it downloads to:
+```
+aws secretsmanager create-secret --name gridwatch/gcp-loader-key --secret-string file://path/to/the-downloaded-key.json --region eu-west-2
+rm path/to/the-downloaded-key.json
+```
+Delete the local copy immediately after it's in Secrets Manager — the fewer places a credential like this exists, the smaller the blast radius if your laptop were ever compromised. (`.gitignore` also has a pattern catching common key filenames, as a second layer of protection in case one ever ends up inside the repo folder by accident.)
+
+**11.** 📝 **File — `infra/neso_bigquery_load_lambda_config.json`:** set `gcp_project_id` to your real project ID.
+
+**12. Deploy the Lambda:**
+```
+python infra/deploy_bigquery_load_lambda.py
+```
+Slower than the earlier Lambda deploys — it's genuinely downloading `google-cloud-bigquery` and its dependencies before it can package anything.
+
+**13. Test it standalone** before wiring it in: 🌐 **Browser** → Lambda console → `gridwatch-bigquery-load` → **Test** tab → any event name, default `{}` body → **Test**. Check the response for `rows_loaded`.
+
+**14. Wire it into the workflow:**
+```
+python infra/deploy_stepfunctions.py
+```
+This updates the state machine to a third state (`LoadCuratedIntoBigQuery`, chained after the Glue step) and widens its role to invoke both Lambdas, on top of the Glue permissions from Phase 3.
+
+**15. Test the full three-step chain:** Step Functions console → `gridwatch-neso-ingestion` → **Start execution** → watch `InvokeNesoIngestLambda` → `RunNesoTransformGlueJob` → `LoadCuratedIntoBigQuery` all turn green in order.
+
+**16. Verify end to end, then commit.** Check BigQuery for the new rows, then commit `warehouse/`, `ingestion/lambdas/neso_bigquery_load/`, and the changed `infra/` files to a feature branch and merge.
+
+**Definition of done:** all three Phase 1 tables loaded into BigQuery with the `region_id` join key confirmed clean, real NESO data landing in `fact_carbon_intensity_readings` automatically every day as the third step of the same Step Functions workflow from Phases 2-3, and both the manual bridge script and its automated Lambda equivalent version-controlled and deployed the same repeatable way as everything else in this project.
+
+### What — argument and concept reference
+
+- **Application Default Credentials (ADC)** — the credential set Google's client libraries (as opposed to the `gcloud` CLI itself) look for automatically. `gcloud auth application-default login` sets these up; a genuinely separate login step from `gcloud auth login`, which only authenticates the CLI.
+- **GCP service account** — GCP's equivalent of an AWS IAM role: a non-human identity that code can act as, with its own permissions, distinct from your own Google account.
+- **Service account key** — a long-lived credential (a JSON file) that lets code authenticate *as* a service account without a live login flow. The thing Workload Identity Federation exists to make unnecessary.
+- **Workload Identity Federation (WIF)** — lets GCP trust an external identity (here, an AWS IAM role) directly, so a workload exchanges its own short-lived credentials for a short-lived GCP token at runtime, with no static key ever created or stored. The road not taken in this phase, deliberately, in favor of a simpler first version — worth revisiting later.
+- **`roles/storage.objectCreator` vs. `roles/storage.objectAdmin`** — GCS permission tiers. Creator can only write new objects; overwriting an existing one needs delete permission on the old version too, which only Admin (or a custom role including `storage.objects.delete`) grants.
+- **`roles/bigquery.dataEditor` vs. `roles/bigquery.jobUser`** — dataEditor covers reading/writing data within a specific dataset; jobUser is what actually lets an identity *run* a query or load job at all, and — unlike dataEditor — has no dataset-scoped equivalent, only project-level.
+- **BigQuery dataset ACLs vs. Cloud IAM** — BigQuery historically managed dataset-level access through its own ACL system (what the console's **Sharing** button edits), predating and still coexisting with Cloud IAM's newer `bq add-iam-policy-binding` equivalent — the latter isn't uniformly available on every project yet.
+- **`s3:ListBucket` vs. `s3:GetObject`** — two separately-scoped S3 permissions with different required `Resource` shapes: `GetObject` needs an object-level ARN (`bucket/key`), but `ListBucket` — what a paginated listing call like `list_objects_v2` actually uses — needs the *bucket-level* ARN (no key), optionally narrowed with an `s3:prefix` condition. Granting only the first is a common, easy-to-miss gap when a script both lists and reads objects.
+- **Lambda deployment package size limits** — 50MB compressed for a direct/inline upload; up to 250MB unzipped when the package is loaded from S3 instead. `deploy_bigquery_load_lambda.py` checks the built zip's size and switches between the two automatically.
+- **`pip install --platform manylinux2014_x86_64 --python-version 3.13 --only-binary=:all:`** — downloads prebuilt wheels for Lambda's own Linux environment regardless of what OS the deploy script itself runs on. Without this, `pip` installs packages built for your own machine, which fail to import once uploaded to Lambda.
+- **`WRITE_APPEND`** — the BigQuery load disposition used here: each run adds its rows rather than replacing the table's contents. Correct for a growing time-series fact table, but means re-running a load for the same day twice appends that day's rows twice — an accepted, documented limitation rather than a solved problem, matched to what this project actually needs rather than over-engineered.
 
 ## Phase 5 — SQL analysis
 

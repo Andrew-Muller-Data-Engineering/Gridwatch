@@ -46,7 +46,7 @@ Analyze & report — SQL + business case
 - [x] Phase 1 — Mock customer/usage data generation (450 accounts, region-weighted, seasonally-aware)
 - [x] Phase 2 — Real data ingestion (Lambda + Step Functions, deployed from the repo via boto3, scheduled daily at 9am UK time via EventBridge)
 - [x] Phase 3 — Transform (Glue Python Shell, chained into the same Step Functions workflow, curated partitioned Parquet in S3)
-- [ ] Phase 4 — Load into BigQuery
+- [x] Phase 4 — Load into BigQuery (Phase 1 mock data + real NESO data bridged cross-cloud from S3, fully automated as the third step of the daily workflow)
 - [ ] Phase 5 — SQL analysis
 - [ ] Phase 6 — Business case write-up
 
