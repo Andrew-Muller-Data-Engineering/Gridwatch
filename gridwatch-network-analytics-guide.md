@@ -744,6 +744,8 @@ print(f"Generated {len(accounts)} accounts, {len(users)} users, {len(events)} ev
 - **Why Step Functions wraps a single Lambda, rather than just scheduling the Lambda directly:** you could trigger the Lambda straight from EventBridge with no Step Functions involved — it would work. Wrapping it adds automatic retries (the API being briefly unavailable shouldn't mean a missed day of data) and a visual execution history you can screenshot for your portfolio, at basically zero extra cost (Step Functions' 4,000 free monthly state transitions comfortably covers a Lambda you're calling once a day or even every 30 minutes). It's also exactly where the distribution-level Lambda plugs in later, as a second branch in the same workflow — not a decision you want to retrofit once you're already scaling this into a multi-branch workflow.
 - **Why daily to start, not the full 30-minute settlement-period cadence:** the guide's Phase 2 plan mentions both. Daily is the better starting cadence while you're learning the AWS console — fewer executions to reason about while you're checking things work, comfortably inside every free-tier limit, and trivial to tighten to 30 minutes later (it's one field in the EventBridge schedule, not a code change).
 - **Why a boto3 deploy script instead of the AWS Console's inline code editor:** the original plan here was console copy-paste — genuinely the simplest possible first deploy, and still how the Step Functions definition below gets deployed. But it means the console, not the repo, is the actual source of truth for what code is running: edit in the console and forget to copy it back into VS Code, and the repo silently goes stale — the exact failure mode a version-controlled "record of what's deployed" is meant to prevent, and the reason for switching before any code was actually pasted in. `infra/deploy_neso_ingest.py` fixes that the way a team that keeps Lambda code and config in a repo typically would: the handler code and its AWS configuration (runtime, memory, IAM role and permissions) both live in the repo as plain files, and a small boto3 script pushes them to AWS. Every deploy becomes a `git`-trackable action, and the console becomes somewhere you go to *observe* the function (logs, test runs), not edit it. It's not a full infrastructure-as-code framework (that's AWS SAM or CDK — a bigger jump, worth considering later once this pattern feels familiar) but it removes the console as a hidden source of truth, which is the part that actually matters for a "record of our Lambda code and config" habit.
+- **Why extend the same boto3-deploy pattern to Step Functions and EventBridge, rather than stopping at the Lambda:** the exact same argument applies here — pasting the state machine's ASL into the console, or clicking through EventBridge Scheduler's UI, works fine once, but leaves the console as the only place either resource's real configuration lives, exactly the problem just solved for the Lambda. `infra/deploy_stepfunctions.py` follows the identical shape as the Lambda's deploy script — declarative JSON config plus trust policies plus a boto3 script that creates-or-updates — so by the end of Phase 2 there's one consistent pattern across every AWS resource in the project, not a different workflow per service. It also removes the one genuinely manual, error-prone step from the original plan — hand-copying your AWS account ID into the state machine's Lambda ARN — since the script now looks it up itself via STS (Security Token Service — the AWS API for asking "who am I currently authenticated as").
+- **Why a fixed daily time (9am, Europe/London) rather than a rolling 24-hour interval:** EventBridge's `rate(1 day)` expression is anchored to whenever the schedule happened to be created, not a specific clock time — perfectly fine for testing, but not what you'd want for something meant to double as a daily reporting feed, where a predictable, fixed local time matters more than the exact interval between runs. Switching to a `cron(0 9 * * ? *)` expression with an explicit `Europe/London` timezone fixes the run to 9am local time year-round, correctly adjusting for BST/GMT — a cron expression alone is evaluated in UTC, so without the timezone setting, "9am" would quietly become "9am UTC" and drift by an hour every time the clocks change.
 
 ### How
 
@@ -793,35 +795,37 @@ This does everything the original Steps 4-6 did by hand in the console: creates 
 4. You should see **Execution result: succeeded**, with a response showing the `bucket` and `key` your function wrote to
 5. Confirm it for real: search "S3" → open your bucket → browse into `raw/neso-demand/` → you should see today's date folder, and inside it a `.json` file. Open it (Download, or click **Open**) and check it looks like real Carbon Intensity data — a `data` array containing a `regions` array with 18 entries
 
-**6. Create the Step Functions state machine.** First, find your AWS account ID (you'll need it for the next step): 🖥️ **Terminal:** `aws sts get-caller-identity` — the `Account` field in the output.
+**6. Deploy the Step Functions state machine and its EventBridge schedule — again straight from the repo, no console paste required.** Alongside `infra/neso_ingest_state_machine.json` (the workflow definition itself, unchanged from before), your `infra/` folder now also holds `neso_ingest_stepfunctions_config.json` (settings for both the state machine and its schedule), `neso_ingest_stepfunctions_trust_policy.json` and `neso_ingest_scheduler_trust_policy.json` (the trust policy each resource's own role needs), and `deploy_stepfunctions.py` (the script that deploys all of it). Save these into your `infra/` folder now if you haven't already — see `docs/infra-cheatsheet.md` for a full explanation of what each individual file does.
+
+Before running it, open `infra/neso_ingest_stepfunctions_config.json` and check the values match your setup:
+- `lambda_function_name` — must match the function name from Step 4 above (`gridwatch-neso-ingest` unless you changed it)
+- `region` — must match wherever you deployed the Lambda (`eu-west-2` unless you changed it)
+- `schedule_expression` and `schedule_expression_timezone` — already set to `cron(0 9 * * ? *)` and `"Europe/London"`, a fixed 9am-UK-time daily run (see Why above for why a cron expression plus an explicit timezone, rather than a simple rate). Change these two values if you'd prefer a different time or cadence.
+
+🖥️ **Terminal** (`.venv` activated, inside `gridwatch`):
+```
+python infra/deploy_stepfunctions.py
+```
+This does everything the original Steps 6-8 did by hand in the console: looks up your AWS account ID and the Lambda's ARN automatically (no more manually replacing `YOUR_ACCOUNT_ID` yourself), creates the state machine's execution role (scoped to just `lambda:InvokeFunction` on your one function) and the state machine itself, then creates the schedule's own execution role (scoped to just `states:StartExecution` on your one state machine) and the schedule itself. You'll see progress printed as it runs — `Created IAM role...`, `Created state machine...`, `Created EventBridge schedule...`.
+
+**From now on, whenever you change the workflow definition or the schedule's cadence:** edit the relevant file, then just re-run `python infra/deploy_stepfunctions.py` again — like the Lambda's deploy script, it detects what already exists and updates it in place instead of creating it fresh.
+
+**7. Test the state machine manually.**
 🌐 **Browser (AWS Console):**
-1. Search "Step Functions" → **State machines** → **Create state machine**
-2. Choose to write it in code (look for **Code** / **Definition** as the editing mode, rather than the visual drag-and-drop designer)
-3. Paste in the contents of `infra/neso_ingest_state_machine.json`, but first replace `YOUR_ACCOUNT_ID` in that ARN with your real account ID from the command above (leave `eu-west-2` and `gridwatch-neso-ingest` as they are, assuming you named things exactly as above)
-4. Type: **Standard**
-5. Name: `gridwatch-neso-ingestion`
-6. When asked about permissions, let it **create a new IAM role** — Step Functions will detect the Lambda referenced in your definition and generate a role scoped to invoke just that function
-7. **Create state machine**
+1. Search "Step Functions" → **State machines** — first check the region selector in the very top-right corner of the console is set to **eu-west-2 (London)**, or your new state machine won't appear in the list (an easy few minutes to lose if a different region was left selected from an earlier session)
+2. Click `gridwatch-neso-ingestion` → **Start execution** → leave the input as the default `{}` → **Start execution**
+3. Watch the execution graph — the single state should turn green (succeeded) within a few seconds
+4. Check S3 again for a new object — confirms the whole chain (Step Functions → Lambda → S3) works end to end
 
-**7. Test the state machine.**
-🌐 **Browser (AWS Console), on the state machine's page:**
-1. Click **Start execution** → leave the input as the default `{}` → **Start execution**
-2. Watch the execution graph — the single state should turn green (succeeded) within a few seconds
-3. Check S3 again for a new object — confirms the whole chain (Step Functions → Lambda → S3) works end to end
+**8. Confirm the schedule is live.**
+🌐 **Browser (AWS Console), same region:**
+1. Search "EventBridge" → **Scheduler**
+2. Click `gridwatch-neso-daily` and check the **Schedule** section shows your cron expression and `Europe/London` as the timezone
+3. Nothing to configure here — this step is only confirming what the script already created matches what you expect
 
-**8. Schedule it with EventBridge.**
-🌐 **Browser (AWS Console):**
-1. Search "EventBridge" → look for **Scheduler** in the left-hand navigation (the newer, more flexible way to schedule things — if your console shows a different layout by the time you're doing this, search for "schedule" or "rule" and look for anything that lets you target a Step Functions state machine on a timer)
-2. **Create schedule**
-3. Name: `gridwatch-neso-daily`
-4. Schedule pattern: **Recurring schedule** → rate-based, **1 day** (you can tighten this to a 30-minute cadence later — see the Why section)
-5. Target: **Step Functions** → **StartExecution** → select `gridwatch-neso-ingestion`
-6. Permissions: let it auto-create the role needed to start the state machine
-7. **Create schedule**
+**9. Verify end to end, then commit.** Wait for the next scheduled run (9am UK time, or trigger it manually the same way as Step 7 to confirm sooner), check S3 for the new object, then commit `infra/` to a feature branch and merge — same pattern as Phase 1.
 
-**9. Verify end to end, then commit.** Wait for the next scheduled run (or trigger it manually the same way as Step 7 to confirm sooner), check S3 for the new object, then commit `ingestion/` and `infra/` to a feature branch and merge — same pattern as Phase 1.
-
-**Definition of done:** raw NESO data landing reliably in S3 on a schedule with no manual intervention, a Step Functions execution graph you can screenshot for your portfolio, and the Lambda's code *and* its AWS configuration (IAM role, memory, timeout) version-controlled in the repo and deployed with a repeatable `python infra/deploy_neso_ingest.py` rather than pasted into the console by hand.
+**Definition of done:** raw NESO data landing reliably in S3 on a fixed daily schedule (9am, Europe/London) with no manual intervention, a Step Functions execution graph you can screenshot for your portfolio, and every piece of this — the Lambda's code and config, the state machine definition, and the EventBridge schedule — version-controlled in the repo and deployed with two repeatable scripts (`python infra/deploy_neso_ingest.py`, `python infra/deploy_stepfunctions.py`) rather than pasted or clicked together in the console.
 
 ### What — argument and concept reference
 
@@ -836,20 +840,76 @@ This does everything the original Steps 4-6 did by hand in the console: creates 
 - **`Retry` block** — `ErrorEquals: ["States.ALL"]` matches any error type; `IntervalSeconds`/`MaxAttempts`/`BackoffRate` control how long to wait before retrying, how many times, and how much longer to wait after each failed attempt (exponential backoff).
 - **EventBridge Scheduler** — AWS's dedicated scheduling service (distinct from the older "EventBridge Rules" you may see referenced elsewhere) for triggering something — here, a Step Functions execution — on a recurring or one-off schedule.
 - **Execution role** — the IAM role a Lambda function (or state machine) runs as; determines what AWS resources it's allowed to touch, separately from your own IAM user's permissions.
+- **`rate()` vs. `cron()` expressions** — the two ways to define an EventBridge schedule's cadence. `rate(1 day)` just repeats every fixed interval, counted from whenever the schedule was created — simple, but with no fixed clock time. `cron(0 9 * * ? *)` instead pins the schedule to exact fields (minute, hour, day-of-month, month, day-of-week) — this one means "at minute 0 of hour 9, every day" — giving you a predictable, fixed time of day rather than a rolling interval.
+- **`ScheduleExpressionTimezone`** — an IANA timezone name (e.g. `"Europe/London"`) attached to a schedule so its `cron()` expression is evaluated in that local timezone instead of UTC, and automatically adjusts for daylight saving (BST/GMT) without you ever needing to touch the expression itself twice a year.
+- **Cross-service IAM role chaining** — the same least-privilege idea from the Lambda's role, now applied at every link in the chain: the Lambda's role can only write to one S3 bucket; the state machine's role can only invoke that one Lambda (`lambda:InvokeFunction`, scoped to its ARN); the schedule's role can only start that one state machine (`states:StartExecution`, scoped to its ARN). No single role in the pipeline can do more than the one specific thing it needs to.
+- **`describe_state_machine` / `create_state_machine` / `update_state_machine`, `get_schedule` / `create_schedule` / `update_schedule`** — the boto3 methods `deploy_stepfunctions.py` uses to check whether a resource already exists (an exception means "not found yet") and switch between creating it fresh or updating it in place — the same create-or-update pattern `deploy_neso_ingest.py` uses for the Lambda and its role.
 
 ## Phase 3 — Transform (cost-aware Glue → curated S3)
 
-**What you're building:** cleaned, validated, partitioned data, ready to load.
+### Why
 
-**The cost trade-off, addressed directly:**
-- **Recommended path:** use a **Glue Python Shell job** (not Spark) at the smallest DPU setting (0.0625 DPU). This is the cheapest Glue compute option — a fraction of a penny per short run — and still gives you real, CV-legitimate Glue experience. Trigger it as the next step in your Step Functions workflow.
-- **Alternative if you want strictly £0:** do the transform inside the same Lambda functions from Phase 2 (pandas/pyarrow) instead, and run a **Glue Crawler** occasionally just to register schemas in the (free) Data Catalog. Noting in your write-up that you evaluated the Glue-vs-Lambda cost trade-off and made a deliberate choice is itself a legitimate, CV-worthy architectural decision.
+- **Why a Glue Python Shell job, not Spark (Glue ETL):** Glue's Spark-based ETL jobs are built for genuinely large datasets — they spin up a small cluster, which costs real money even for a job processing a handful of small JSON files. A **Python Shell** job is a single lightweight Python process, billed at Glue's smallest DPU (Data Processing Unit — Glue's unit of compute) tier of 0.0625 DPU — a fraction of a penny per run — while still using the real AWS Glue service, so it's genuine, CV-legitimate Glue experience rather than a workaround that avoids Glue entirely. For GridWatch's actual daily volume (18 small region readings, once a day), Spark would be solving a problem this project doesn't have.
+- **Why chain the transform into the same Step Functions workflow, rather than a separate schedule:** the two steps are genuinely sequential — the transform has nothing to read until ingestion has run — so representing that as one workflow (`InvokeNesoIngestLambda` → `RunNesoTransformGlueJob`) rather than two independently-scheduled resources hoping to line up in the right order is both more correct and gives you one execution graph to screenshot for your portfolio, showing the whole daily pipeline rather than just one slice of it. Step Functions' 4,000 free monthly state transitions comfortably cover two states running once a day.
+- **Why the extra `.sync` in the Glue step's `Resource` ARN (`arn:aws:states:::glue:startJobRun.sync`) matters:** without `.sync`, Step Functions would call the Glue `StartJobRun` API, get back "started," and immediately mark that state as *succeeded* — regardless of whether the job goes on to actually finish or fail a minute later. `.sync` tells Step Functions to keep watching and only mark the state complete once the Glue job itself finishes, and to mark it *failed* if the Glue job fails. For a state whose entire purpose is "did the transform actually work," that distinction is the difference between a meaningful success signal and a rubber stamp.
+- **Why the state machine's role needed new permissions, not a second role:** the workflow itself grew from one step to two, so the identity running that workflow needs permission to do the new thing — same principle as every other role in this project, just applied to a role you'd already created. The new permissions are still scoped as narrowly as everything else: `glue:StartJobRun`/`GetJobRun`/`BatchStopJobRun` on exactly one Glue job's ARN, plus a small `events:PutRule`/`PutTargets`/`DescribeRule` allowance scoped to one specific AWS-managed rule name (`StepFunctionsGetEventForGlueJobRunRule`) that Step Functions creates and uses internally to know when a `.sync` Glue job finishes, rather than polling. That EventBridge rule isn't a resource you ever create or see directly — it's plumbing AWS's `.sync` integration manages for you, and the permission just lets it do that.
+- **Why extend the same config-plus-trust-policy-plus-deploy-script pattern to Glue:** the same argument as Phase 2's Step Functions/EventBridge extension — one consistent shape across every AWS resource in the project. The one genuine difference: a Glue job doesn't run code straight from your repo the way a Lambda does — Glue reads its script from an S3 location — so `deploy_glue_transform.py` has one extra job the earlier scripts didn't: re-uploading the script to S3 on every deploy, so the S3 copy can never quietly drift from what's in the repo (the exact failure mode the original console-paste Lambda workflow risked, avoided here from the start rather than retrofitted).
+- **Why flatten `generationmix` into fixed columns instead of keeping it as a nested list:** the raw API returns each region's fuel mix as a list of `{"fuel": ..., "perc": ...}` pairs. A flat row — one column per fuel type (`wind_pct`, `gas_pct`, and so on) — is what SQL joins, `GROUP BY`, and window functions expect in Phase 5, and what a BigQuery external table can read directly without extra unnesting logic. Deciding this shape is Phase 3's job specifically, in keeping with the raw-zone-holds-everything-unmodified / curated-zone-holds-what's-actually-useful split from Phase 2.
+- **Why cast every column explicitly rather than trust whatever pandas infers:** a single malformed or missing reading (a `null` forecast, a missing fuel type) can otherwise silently turn an entire column's dtype into a generic, harder-to-query "object" type instead of leaving one clean `NaN`/`NaT` in that one row. Explicit casting turns a data-quality problem into a visible missing value instead of an invisible one.
+- **Why avoid `s3fs`:** pandas/pyarrow can write straight to an `s3://...` path if `s3fs` is installed, which would have been the shorter script — but it's one more third-party dependency to install at job startup (via `--additional-python-modules`) for something `boto3`, already built into every Glue Python Shell job, does perfectly well: write the partitioned Parquet files locally in the job's temp storage, then upload each one with a plain `s3.upload_file()` call. Fewer moving parts at job startup for the same result.
 
-**What the transform does either way:** parse raw JSON/CSV, handle missing or malformed readings, filter Phase 2's raw feed down to just the 14 real DNO regions (dropping the England/Scotland/Wales/GB aggregate entries, which don't have a matching `region_id` in Phase 1's data), cast types correctly, convert settlement periods to proper timestamps, and write out as **partitioned Parquet** (partitioned by date) into a `curated/` S3 prefix.
+### How
+
+**1. The transform job's own code and deploy config already live in your repo.** `transform/glue_jobs/clean_neso_data.py` is the actual transform logic — 📝 open it in VS Code and read it through before deploying, same habit as `handler.py` in Phase 2. Alongside it, `infra/` gained three new files: `neso_transform_glue_config.json` (the job's settings — name, role name, script location both locally and in S3, DPU tier, and the raw/curated S3 prefixes it reads from and writes to), `neso_transform_trust_policy.json` (trusts `glue.amazonaws.com`, same shape as the other trust policies), and `deploy_glue_transform.py` (the deploy script). Two existing files also changed: `neso_ingest_state_machine.json` now defines a second state (`RunNesoTransformGlueJob`, chained after the Lambda invoke — see Why above), and `neso_ingest_stepfunctions_config.json` gained a `glue_job_name` field so the Step Functions deploy script can build the Glue job's ARN.
+
+**2. Check `infra/neso_transform_glue_config.json` before deploying.** `raw_s3_bucket`/`curated_s3_bucket` should match the bucket you created in Phase 2 — since this project keeps raw and curated data in the same bucket under different prefixes (`raw/neso-demand/` vs. `curated/neso-demand/`) rather than provisioning a second bucket, there's nothing new to create here, just confirm the bucket name matches.
+
+**3. Deploy the Glue job.**
+🖥️ **Terminal** (`.venv` activated, inside `gridwatch`):
+```
+python infra/deploy_glue_transform.py
+```
+This creates the job's execution role (the AWS-managed `AWSGlueServiceRole` policy, plus an inline policy scoped to read the raw prefix, write the curated prefix, and read the job's own script location), uploads `clean_neso_data.py` to S3, then creates the Glue job itself pointed at that S3 location. You'll see `Created IAM role...`, `Uploaded transform/glue_jobs/clean_neso_data.py...`, `Created Glue job...` printed as it runs.
+
+**From now on, every time you change `clean_neso_data.py`:** save the file, then just re-run `python infra/deploy_glue_transform.py` again — it re-uploads the script and updates the job in place, the same edit-deploy loop as the Lambda.
+
+**4. Test the Glue job on its own, before wiring it into the full workflow.**
+🌐 **Browser (AWS Console):**
+1. Search "Glue" → **ETL jobs** → click `gridwatch-neso-transform`
+2. Click **Run** (top-right)
+3. Click the **Runs** tab and watch until the status shows **Succeeded** — a Python Shell job has real startup time, often 30-90 seconds, even though the transform logic itself runs in a couple of seconds once it's up
+4. Check S3: your bucket → `curated/neso-demand/` → you should see a `reading_date=<today's date>/` folder containing a `.parquet` file
+
+**5. Deploy the updated Step Functions workflow, chaining the two steps together.**
+🖥️ **Terminal:**
+```
+python infra/deploy_stepfunctions.py
+```
+Same command you've run before — this time it updates the state machine's definition (picking up the new second state) and widens its role to the new Lambda-plus-Glue permissions (see Why above). You'll see `Attached '...-invoke-lambda-and-glue'...` and `Updated existing state machine...` in the output, confirming both changes landed.
+
+**6. Test the full chain end to end.**
+🌐 **Browser (AWS Console):**
+1. Search "Step Functions" → **State machines** → `gridwatch-neso-ingestion` (check the region selector shows **eu-west-2 (London)** first)
+2. **Start execution** → leave the input as `{}` → **Start execution**
+3. Watch the graph: `InvokeNesoIngestLambda` turns green first, then `RunNesoTransformGlueJob` — the second state takes longer to complete than the first, for the same Glue startup-time reason as Step 4
+4. Once the whole execution shows **Succeeded**, check `curated/neso-demand/reading_date=<today>/` in S3 again — you should see a *second* Parquet file alongside the one from Step 4, confirming the whole chain (Step Functions → Lambda → S3 → Glue → S3) ran on its own, not just the piece you'd already tested manually
+
+**7. Verify end to end, then commit.** Wait for tomorrow's 9am scheduled run (or trigger it manually the same way as Step 6 to confirm sooner), then commit `transform/` and `infra/` to a feature branch and merge — same pattern as every phase before this one.
 
 **An honesty note for later:** you won't have access to real substation capacity thresholds (that's internal DNO data), so "stress" in this project should be framed as a *relative* measure — e.g. top-percentile load periods for a given substation/region — rather than claiming to know true remaining capacity. Say this explicitly in your write-up; it reads as more credible, not less.
 
-**Definition of done:** curated, partitioned Parquet in S3, registered in the Glue Data Catalog, ready to load.
+**Definition of done:** curated, partitioned Parquet landing in S3 automatically every day, as the second step of the same Step Functions workflow from Phase 2, with the transform's code and AWS configuration (IAM role, DPU tier, job settings) version-controlled in the repo and deployed with a repeatable `python infra/deploy_glue_transform.py` rather than clicked together in the console. (Registering the curated schema in the Glue Data Catalog — useful once you're querying it directly via Athena — is deliberately left for later, only if that becomes something you actually need; Phase 4 loads the curated data into BigQuery directly rather than through the Data Catalog.)
+
+### What — argument and concept reference
+
+- **DPU (Data Processing Unit)** — Glue's unit of compute power (already introduced in Part 2's cost breakdown). Python Shell jobs can only be set to **0.0625** or **1** DPU — a much narrower choice than Spark ETL jobs, which scale across many workers; 0.0625 is the smallest and cheapest option, and comfortably enough for this job's actual workload.
+- **`GlueVersion`** — determines which Python version and which libraries come pre-installed in a Python Shell job's environment. `"3.0"` here gives Python 3.9 with `pandas`, `numpy`, and `boto3` pre-installed — but notably **not** `pyarrow`, which is why the deploy script requests it separately (see `--additional-python-modules` below).
+- **`--additional-python-modules`** — a Glue job parameter (set in `deploy_glue_transform.py`'s `DefaultArguments`) that pip-installs extra packages when the job starts, for anything not already part of the `GlueVersion`'s pre-installed set. Used here to add `pyarrow`, needed for `pandas`/`pyarrow` to write Parquet files.
+- **Hive-style partitioning** — the `reading_date=2026-08-17/` folder-naming convention `pyarrow.parquet.write_to_dataset(..., partition_cols=[...])` produces. Naming partition folders `<column>=<value>` (rather than just `2026-08-17/`) is a widely recognized convention that lets Athena, a Glue Crawler, or a BigQuery external table automatically discover which partitions exist and skip straight to the relevant one for a filtered query, instead of you registering each date by hand.
+- **`.sync` service integration** — a suffix Step Functions recognizes on certain AWS service ARNs (`arn:aws:states:::glue:startJobRun.sync` here) meaning "wait for this to actually finish, not just start, before treating the state as complete." Without it, a `Task` state calling `glue:startJobRun` (no `.sync`) would succeed the instant the Glue API confirmed the job had *started* — regardless of whether it went on to actually finish or fail.
+- **`AWSGlueServiceRole`** — an AWS-managed policy (like `AWSLambdaBasicExecutionRole` for Lambda) granting the baseline permissions any Glue job needs to run at all and write its own CloudWatch Logs. `deploy_glue_transform.py` attaches it automatically, on top of the job's own narrowly-scoped inline S3 policy.
+- **`get_job` / `create_job` / `update_job`** — the boto3 Glue methods `deploy_glue_transform.py` uses to check whether the job already exists (an exception means "not found yet") and switch between creating it fresh or updating it in place — the same create-or-update pattern used everywhere else in this project.
+- **`s3.upload_file()`** — the boto3 S3 method used both to push `clean_neso_data.py` up to its script location before deploying the job, and inside the job itself to push each finished Parquet partition file up to the curated zone — ordinary file uploads, doing the job a heavier `s3fs`-based approach would do less transparently.
 
 ## Phase 4 — Load into BigQuery (star schema)
 

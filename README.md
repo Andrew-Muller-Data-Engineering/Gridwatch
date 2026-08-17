@@ -44,8 +44,8 @@ Analyze & report — SQL + business case
 
 - [x] Environment setup (AWS, BigQuery, Git/GitHub, VS Code)
 - [x] Phase 1 — Mock customer/usage data generation (450 accounts, region-weighted, seasonally-aware)
-- [ ] Phase 2 — Real data ingestion (Lambda + Step Functions)
-- [ ] Phase 3 — Transform (Glue)
+- [x] Phase 2 — Real data ingestion (Lambda + Step Functions, deployed from the repo via boto3, scheduled daily at 9am UK time via EventBridge)
+- [x] Phase 3 — Transform (Glue Python Shell, chained into the same Step Functions workflow, curated partitioned Parquet in S3)
 - [ ] Phase 4 — Load into BigQuery
 - [ ] Phase 5 — SQL analysis
 - [ ] Phase 6 — Business case write-up

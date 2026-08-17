@@ -1,0 +1,17 @@
+{
+  "job_name": "gridwatch-neso-transform",
+  "job_role_name": "gridwatch-neso-transform-role",
+  "region": "eu-west-2",
+  "script_local_path": "transform/glue_jobs/clean_neso_data.py",
+  "script_s3_bucket": "gridwatch-raw-andy817",
+  "script_s3_key": "glue-scripts/clean_neso_data.py",
+  "glue_version": "3.0",
+  "python_version": "3.9",
+  "max_capacity": 0.0625,
+  "timeout_minutes": 15,
+  "additional_python_modules": "pyarrow",
+  "raw_s3_bucket": "gridwatch-raw-andy817",
+  "raw_s3_prefix": "raw/neso-demand/",
+  "curated_s3_bucket": "gridwatch-raw-andy817",
+  "curated_s3_prefix": "curated/neso-demand/"
+}

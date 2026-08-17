@@ -1,5 +1,5 @@
 {
-  "Comment": "GridWatch — invokes the NESO ingestion Lambda, with retries, on a schedule set by EventBridge.",
+  "Comment": "GridWatch — invokes the NESO ingestion Lambda, then runs the Glue transform job against that data, with retries at each step, on a schedule set by EventBridge.",
   "StartAt": "InvokeNesoIngestLambda",
   "States": {
     "InvokeNesoIngestLambda": {
@@ -10,6 +10,22 @@
           "ErrorEquals": ["States.ALL"],
           "IntervalSeconds": 30,
           "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "RunNesoTransformGlueJob"
+    },
+    "RunNesoTransformGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "gridwatch-neso-transform"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
           "BackoffRate": 2.0
         }
       ],
