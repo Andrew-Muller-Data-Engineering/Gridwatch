@@ -1,7 +1,7 @@
 import random
 from faker import Faker
 from datetime import date, timedelta
-from regions import REGIONS
+from regions import REGIONS, REGION_PROFILE, CONSTRAINT_PRONE_REGIONS
 
 fake = Faker("en_GB")
 random.seed(42)  # remove once you're happy with the shape of the data — see the What section below
@@ -18,20 +18,36 @@ def random_date_between(start, end):
         return start
     return start + timedelta(days=random.randint(0, days_between))
 
+def pull_toward_financial_year_start(d, earliest, latest, strength=0.35):
+    """Nudges a date some fraction of the way toward the nearest 1 April
+    (the UK utility financial year start, and the point DNOs' budget
+    cycles reset) then clamps it back inside the allowed window.
+    strength=0.35 means "35% of the way there" — enough to create a
+    believable clustering of contract signings around the budget-cycle
+    reset, without making every date suspiciously land on April 1st."""
+    candidates = [date(d.year - 1, 4, 1), date(d.year, 4, 1), date(d.year + 1, 4, 1)]
+    nearest_april = min(candidates, key=lambda c: abs((c - d).days))
+    pulled = d + timedelta(days=int((nearest_april - d).days * strength))
+    return max(earliest, min(latest, pulled))
+
 TIERS = ["Basic", "Pro", "Enterprise"]
 TIER_WEIGHTS = [0.5, 0.35, 0.15]
 
-def generate_accounts(n=250):
+def generate_accounts(n=450):
     accounts = []
     today = date.today()
     earliest_start = today - timedelta(days=18 * 30)  # ~18 months ago
     latest_start = today - timedelta(days=30)          # ~1 month ago
+    region_weights = [REGION_PROFILE[r["region_id"]]["population_weight"] for r in REGIONS]
     for i in range(n):
-        region = random.choice(REGIONS)
+        region = random.choices(REGIONS, weights=region_weights)[0]
         start = random_date_between(earliest_start, latest_start)
+        start = pull_toward_financial_year_start(start, earliest_start, latest_start)
         renewal = start + timedelta(days=365)
         churned = random.random() < 0.15
         churn_date = random_date_between(start, today) if churned else None
+        low_k, high_k = REGION_PROFILE[region["region_id"]]["properties_range"]
+        properties_served = random.randint(low_k * 1000, high_k * 1000)
         accounts.append({
             "account_id": i + 1,
             "account_name": fake.company(),
@@ -41,6 +57,7 @@ def generate_accounts(n=250):
             "contract_start_date": start,
             "renewal_date": renewal,
             "churn_date": churn_date,
+            "properties_served": properties_served,
         })
     return accounts
 
@@ -61,7 +78,17 @@ def generate_users(accounts):
 
 EVENT_TYPES = ["login", "view_dashboard", "view_alert", "acknowledge_alert", "generate_report"]
 EVENT_WEIGHTS = [0.45, 0.25, 0.15, 0.10, 0.05]
-LOW_ENGAGEMENT_REGIONS = {1, 2, 6, 7}  # North Scotland, South Scotland, N Wales/Mersey/Cheshire, South Wales
+
+# Winter months see more grid stress (cold-weather demand peaks), which
+# plausibly means more logins/alerts — mirrors the real seasonal pattern
+# NESO's own demand forecasting has to account for (see the Why section
+# in the guide for the Average Cold Spell methodology this is loosely
+# inspired by — not replicated, just borrowing the "winter matters more"
+# principle).
+SEASONAL_MULTIPLIER = {
+    1: 1.35, 2: 1.30, 3: 1.15, 4: 1.00, 5: 0.90, 6: 0.85,
+    7: 0.80, 8: 0.80, 9: 0.90, 10: 1.05, 11: 1.25, 12: 1.35,
+}
 
 def generate_usage_events(users, accounts_by_id):
     events = []
@@ -69,22 +96,27 @@ def generate_usage_events(users, accounts_by_id):
     for user in users:
         account = accounts_by_id[user["account_id"]]
         base_events_per_week = 6
-        if account["region_id"] in LOW_ENGAGEMENT_REGIONS:
+        if account["region_id"] in CONSTRAINT_PRONE_REGIONS:
             base_events_per_week *= 0.6
-        for week in range(52):
-            n_events = max(0, int(random.gauss(base_events_per_week, 2)))
+        week_start = account["contract_start_date"]
+        while week_start <= today:
+            expected = base_events_per_week * SEASONAL_MULTIPLIER[week_start.month]
+            n_events = max(0, int(random.gauss(expected, 2)))
             for _ in range(n_events):
-                event_date = random_date_between(account["contract_start_date"], today)
+                event_date = week_start + timedelta(days=random.randint(0, 6))
+                if event_date > today:
+                    event_date = today
                 events.append({
                     "user_id": user["user_id"],
                     "event_timestamp": event_date,
                     "event_type": random.choices(EVENT_TYPES, weights=EVENT_WEIGHTS)[0],
                 })
+            week_start += timedelta(days=7)
     return events
 
 import pandas as pd
 
-accounts = generate_accounts(250)
+accounts = generate_accounts(450)
 users = generate_users(accounts)
 accounts_by_id = {a["account_id"]: a for a in accounts}
 events = generate_usage_events(users, accounts_by_id)
